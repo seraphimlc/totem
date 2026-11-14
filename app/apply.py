@@ -13,6 +13,7 @@ import gzip
 import json
 import logging
 import math
+import os
 import shutil
 from pathlib import Path
 from typing import Any, Optional
@@ -21,7 +22,7 @@ import ezdxf
 from ezdxf import bbox as ezbbox
 from ezdxf.math import Matrix44, Vec3
 
-from . import library, projects
+from . import config, library, projects
 
 log = logging.getLogger("cad-studio.apply")
 
@@ -306,13 +307,31 @@ def _import_block(doc, block_name: str) -> bool:
         if dxf:
             candidates.append(Path(dxf))
         stem = src.get("file") or src.get("stem") or item.get("library")
-        for base in (
-            Path("/workspace/cad-nl/dxf"),
-            Path("/opt/cad-studio/current/data/libraries/default"),
-            Path(library.index_path()).parent if hasattr(library, "index_path") and library.index_path() else None,
-        ):
-            if not base:
-                continue
+        bases = []
+        # Optional overrides (Windows / local dev), then the Linux production
+        # locations, then project-local var/ copies.
+        env_dxf = (os.getenv("CAD_LIBRARY_DXF_DIR") or "").strip()
+        if env_dxf:
+            bases.append(Path(env_dxf))
+        env_index = (os.getenv("CAD_LIBRARY_INDEX") or "").strip()
+        if env_index:
+            bases.append(Path(env_index).parent)
+        index_path = library.index_path()
+        bases.extend(
+            [
+                Path("/workspace/cad-nl/dxf"),
+                Path("/opt/cad-studio/current/data/libraries/default"),
+            ]
+        )
+        if index_path:
+            bases.append(index_path.parent)
+        bases.extend(
+            [
+                config.STUDIO_ROOT / "var" / "dxf",
+                config.STUDIO_ROOT / "var" / "libraries" / "default",
+            ]
+        )
+        for base in bases:
             if stem:
                 candidates.append(base / f"{stem}-fixed.dxf")
                 candidates.append(base / f"{stem}.dxf")

@@ -17,6 +17,23 @@ sys.path.insert(0, str(ROOT))
 os.environ.setdefault("CAD_DATA_DIR", "")
 
 MALL = Path("/workspace/cad-nl/tmp/rebuild-indexes/万商城-session.dxf")
+
+
+def _fixture(env_name: str, candidates: list[Path], fallback: str) -> Path:
+    """Env override → original Linux paths → a temp path that will just not exist."""
+    env = (os.getenv(env_name) or "").strip()
+    if env:
+        return Path(env)
+    data = (os.getenv("CAD_DATA_DIR") or "").strip()
+    if data:
+        candidates = [Path(data) / "tmp" / "rebuild-indexes" / Path(fallback).name] + candidates
+    for cand in candidates:
+        if cand.is_file():
+            return cand
+    return Path(tempfile.gettempdir()) / "tuteng-fixtures" / Path(fallback).name
+
+
+MALL = _fixture("TUTENG_DXF_FIXTURE", [MALL], "万商城-session.dxf")
 GOLDEN_SHA_PREFIX = "1d35a37007dce49c"
 OUT = ROOT / "var" / "scene-tests"
 WEB_FIX = ROOT / "web" / "scene-fixtures"
@@ -417,6 +434,10 @@ def test_scene_disk_persist() -> None:
 
 
 def main() -> int:
+    if not MALL.is_file():
+        print(f"SKIP  mall fixture not found: {MALL}", flush=True)
+        print("SKIP  set TUTENG_DXF_FIXTURE to a 万商城 DXF to run the scene tests", flush=True)
+        return 0
     test_golden()
     test_scene_build_and_patch()
     test_later_insert_updates_displayed_scene()

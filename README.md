@@ -25,6 +25,40 @@ chmod 600 .env
 
 对话写在各项目自己的 `chat.json` 里，不写进 `INDEX.md` / `index.json`。
 
+## Windows 本地运行
+
+在 Windows 11 + Python 3.12 上（PowerShell，仓库根目录）：
+
+1. 建虚拟环境并装依赖（会自动从 `.env.example` 复制一份 `.env`）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\setup-venv.ps1
+
+# 或手动：
+C:\Users\<you>\AppData\Local\Programs\Python\Python312\python.exe -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+2. 编辑 `.env`，至少填写 `ACCESS_USERNAME`、`ACCESS_PASSWORD`、`SESSION_SECRET`（缺任意一项时登录不可用，`/api/health` 仍可访问）。不要把 `.env` 提交进 git。
+
+3. 启动：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\run-dev.ps1
+# 或
+scripts\run-dev.bat
+```
+
+浏览器打开 http://127.0.0.1:8780 。脚本默认绑定 `127.0.0.1:8780`，可用 `HOST` / `PORT` 环境变量覆盖。
+
+Windows 说明：
+
+- 中文字体自动选 `C:\Windows\Fonts\msyh.ttc` 等系统字体；也可用 `CAD_CJK_FONT` / `CAD_CJK_FONT_BOLD` 指定字体文件。Linux 仍用 Noto CJK。
+- 队列锁在 Windows 上走 `msvcrt.locking`（见 `app/filelock.py`），语义与 Linux 的 `flock` 一致，仍然只支持单进程 worker。
+- 没有 `dwg2dxf`（LibreDWG / ODA 转换器）时只能上传 DXF。若本机装了 dwg2dxf，用 `CAD_DWG2DXF` 指向可执行文件；否则上传 DWG 会提示先在 AutoCAD 里另存为 DXF。
+- 组件库 / 配置查找支持环境变量覆盖：`CAD_LIBRARY_INDEX`（索引 JSON）、`CAD_LIBRARY_DXF_DIR`（图块 DXF 目录），之后才回落到 Linux 生产路径和项目内 `var/`。
+- 自造 DXF 的冒烟测试不依赖真实图纸：`.venv\Scripts\python.exe scripts\test_preview_sanitize.py`、`.venv\Scripts\python.exe scripts\test_index_sqlite.py`。依赖真实样本图的 `scripts\test_apply_preview.py`、`scripts\test_scene.py`、`scripts\session_tests.py` 在没有样本时会打印 `SKIP` 并以 0 退出，可用 `TUTENG_DXF_FIXTURE`、`TUTENG_CANTEEN_DXF`、`TUTENG_MALL_DXF`、`TUTENG_ROOT` 指向样本。
+
 ## 环境变量
 
 见 `.env.example`。不要把 `.env` 或 `.access_password` 提交进 git。

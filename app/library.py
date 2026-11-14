@@ -29,6 +29,8 @@ def _index_path() -> Optional[Path]:
             config.STUDIO_ROOT / "data" / "libraries" / "default" / "index.json",
             config.STUDIO_ROOT.parent / "libraries" / "default" / "index.json",
             Path("/workspace/cad-nl/libraries/default/index.json"),
+            # Project-local fallback for Windows / local dev.
+            config.STUDIO_ROOT / "var" / "libraries" / "default" / "index.json",
         ]
     )
     for p in candidates:

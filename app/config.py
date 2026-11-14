@@ -40,8 +40,32 @@ CACHE_DIR = VAR_DIR / "preview-cache"
 SCENE_DIR = VAR_DIR / "scene-cache"
 PROJECTS_FILE = Path(__file__).resolve().parent / "projects.json"
 
-CJK_FONT = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
-CJK_FONT_BOLD = "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"
+_LINUX_CJK_FONT = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
+_LINUX_CJK_FONT_BOLD = "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"
+_WINDOWS_CJK_FONTS = (
+    r"C:\Windows\Fonts\msyh.ttc",
+    r"C:\Windows\Fonts\msyhbd.ttc",
+    r"C:\Windows\Fonts\simhei.ttf",
+    r"C:\Windows\Fonts\simsun.ttc",
+)
+
+
+def _pick_cjk_font(env_name: str, linux_default: str, *, skip: str = "") -> str:
+    """Env override first, then the first existing platform font, else ""."""
+    override = os.getenv(env_name, "").strip()
+    if override:
+        return override
+    candidates = [linux_default]
+    if os.name == "nt":
+        candidates = [p for p in _WINDOWS_CJK_FONTS if p != skip]
+    for candidate in candidates:
+        if Path(candidate).is_file():
+            return candidate
+    return ""
+
+
+CJK_FONT = _pick_cjk_font("CAD_CJK_FONT", _LINUX_CJK_FONT)
+CJK_FONT_BOLD = _pick_cjk_font("CAD_CJK_FONT_BOLD", _LINUX_CJK_FONT_BOLD, skip=CJK_FONT)
 
 DEFAULT_MODEL = "Tifa-6.1-sol"
 MODELS = (

@@ -7,7 +7,6 @@ workers leave the queue alone.
 
 from __future__ import annotations
 
-import fcntl
 import json
 import logging
 import threading
@@ -16,7 +15,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from . import config
+from . import config, filelock
 
 log = logging.getLogger("cad-studio.archive")
 
@@ -132,16 +131,13 @@ def start_worker(*, uploader: Optional[Callable[..., dict[str, str]]] = None) ->
             return True
         queue_root()
         lock_path = queue_root() / "worker.lock"
-        fd = open(lock_path, "a+")
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            fd.close()
+        fd = filelock.acquire(lock_path)
+        if fd is None:
             log.info("archive queue worker already running in another process")
             return False
         fd.seek(0)
         fd.truncate()
-        fd.write(f"pid={os_getpid()} started={_now()}\n")
+        fd.write(f"pid={os_getpid()} started={_now()}\n".encode("utf-8"))
         fd.flush()
         _LOCK_FD = fd
         _recover_running()
@@ -167,11 +163,7 @@ def stop_worker(timeout: float = 5.0) -> None:
         thread.join(timeout)
     _WORKER = None
     if _LOCK_FD is not None:
-        try:
-            fcntl.flock(_LOCK_FD, fcntl.LOCK_UN)
-            _LOCK_FD.close()
-        except Exception:
-            pass
+        filelock.release(_LOCK_FD)
         _LOCK_FD = None
 
 

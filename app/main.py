@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 import traceback
 from pathlib import Path
 from typing import Any, Optional
@@ -55,6 +56,8 @@ app = FastAPI(title="图腾", docs_url=None, redoc_url=None, openapi_url=None, l
 
 
 _PUBLIC_API = {"/api/health", "/api/login", "/api/logout"}
+# Overlay ids become file names under var/overlays/<project>/; keep them tame.
+_OVERLAY_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,80}")
 
 
 @app.middleware("http")
@@ -253,6 +256,8 @@ def api_preview(
     source: Optional[str] = Query(default=None),
     user: str = Depends(_user),
 ):
+    if overlay and not _OVERLAY_ID_RE.fullmatch(overlay):
+        raise HTTPException(status_code=400, detail="叠图编号不合法。")
     proj = _proj_or_404(project_id, need_ready=True)
     if overlay:
         path = cad_render.overlay_path_for(project_id, overlay)

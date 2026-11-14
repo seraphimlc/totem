@@ -538,6 +538,49 @@ def _ensure_dxf(proj: dict[str, Any], st: dict[str, Any]) -> Path:
     raise ValueError("只接受 DWG 或 DXF 图纸。")
 
 
+def _windows_dwg2dxf_candidates() -> list[str]:
+    """Extra lookup paths for Windows installs (LibreDWG / ODA builds)."""
+    found: list[str] = []
+    local = (os.getenv("LOCALAPPDATA") or "").strip()
+    if local:
+        programs = Path(local) / "Programs"
+        found.extend(str(p) for p in programs.glob("**/dwg2dxf.exe"))
+        found.extend(str(p) for p in programs.glob("**/bin/dwg2dxf.exe"))
+    for base in (r"C:\Program Files\DWG", r"C:\Program Files\LibreDWG", r"C:\Program Files (x86)\DWG"):
+        try:
+            if Path(base).is_dir():
+                found.extend(str(p) for p in Path(base).glob("**/dwg2dxf.exe"))
+        except OSError:
+            continue
+    return found
+
+
+def _which_where(name: str) -> str:
+    """shutil.which, then the Windows `where` command for shims it misses."""
+    hit = shutil.which(name)
+    if hit:
+        return hit
+    if os.name != "nt":
+        return ""
+    try:
+        import subprocess
+        proc = subprocess.run(
+            ["where", name],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+    except Exception:
+        return ""
+    for line in (proc.stdout or "").splitlines():
+        line = line.strip()
+        if line and Path(line).is_file():
+            return line
+    return ""
+
+
 def find_dwg2dxf() -> Optional[str]:
     env = (os.getenv("CAD_DWG2DXF") or "").strip()
     candidates = [
@@ -548,6 +591,10 @@ def find_dwg2dxf() -> Optional[str]:
         "/usr/local/bin/dwg2dxf",
         shutil.which("dwg2dxf") or "",
     ]
+    if os.name == "nt":
+        candidates.extend(_windows_dwg2dxf_candidates())
+        candidates.append(_which_where("dwg2dxf"))
+        candidates.append(_which_where("dwg2dxf.exe"))
     for path in candidates:
         if path and Path(path).is_file() and os.access(path, os.X_OK):
             return path
@@ -570,9 +617,13 @@ def convert_dwg(src: Path, dest: Path) -> Path:
     cmd = [tool, "-y", "-o", str(tmp_dir), str(tmp_src)]
     # Some builds only accept the input path.
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180
+        )
     except Exception:
-        proc = subprocess.run([tool, str(tmp_src)], capture_output=True, text=True, timeout=180)
+        proc = subprocess.run(
+            [tool, str(tmp_src)], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180
+        )
     produced = list(tmp_dir.glob("*.dxf")) + list(tmp_dir.glob("*.DXF"))
     if not produced:
         raise ValueError("DWG 转换没有成功。请改传 DXF，或检查原文件是否完好。")

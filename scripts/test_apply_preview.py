@@ -18,6 +18,23 @@ os.environ.setdefault("CAD_DATA_DIR", "")
 MALL = Path("/workspace/cad-nl/tmp/rebuild-indexes/万商城-session.dxf")
 PREVIEW_DIR = ROOT / "var" / "preview-tests"
 
+
+def _fixture(env_name: str, candidates: list[Path], fallback: str) -> Path:
+    """Env override → original Linux paths → a temp path that will just not exist."""
+    env = (os.getenv(env_name) or "").strip()
+    if env:
+        return Path(env)
+    data = (os.getenv("CAD_DATA_DIR") or "").strip()
+    if data:
+        candidates = [Path(data) / "tmp" / "rebuild-indexes" / Path(fallback).name] + candidates
+    for cand in candidates:
+        if cand.is_file():
+            return cand
+    return Path(tempfile.gettempdir()) / "tuteng-fixtures" / Path(fallback).name
+
+
+MALL = _fixture("TUTENG_DXF_FIXTURE", [MALL], "万商城-session.dxf")
+
 SQUAT = "做成ACAD TuKuai0155"
 SEAT = "A$C2A8643E5"
 REGION_ID = "subview:水施-007:二层卫排水详图"
@@ -752,9 +769,14 @@ def test_incremental_composite_pdf_and_sse() -> None:
 def main() -> int:
     test_reply_and_history()
     test_overlay_replace_and_undo()
-    test_mall_preview_and_writeback()
-    test_incremental_composite_pdf_and_sse()
-    print("ALL PASSED", flush=True)
+    if MALL.is_file():
+        test_mall_preview_and_writeback()
+        test_incremental_composite_pdf_and_sse()
+        print("ALL PASSED", flush=True)
+    else:
+        print(f"SKIP  mall fixture not found: {MALL}", flush=True)
+        print("SKIP  set TUTENG_DXF_FIXTURE to a 万商城 DXF to run the mall tests", flush=True)
+        print("DONE  remaining tests passed (2 mall tests skipped)", flush=True)
     return 0
 
 
