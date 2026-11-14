@@ -881,6 +881,8 @@ def build_first_index(
     done += SHEETS
     _ping(done, "正在识别房间。")
     rooms = _detect_rooms(texts, sheets, [])
+    indexing.locate_texts(texts, sheets)
+    indexing.attach_labels_nearby(rooms, texts)
     done += ROOMS
     _ping(done, "正在识别设备符号并写入索引。")
     indexing.enrich_inserts(doc, inserts)
@@ -889,6 +891,7 @@ def build_first_index(
         room["equipment_nearby"] = []
     equipment = indexing.equipment_from_inserts(inserts)
     indexing.assign_rooms([rec for rec in equipment if indexing.is_attachable(rec)], rooms)
+    indexing.assign_dining_furniture(equipment, rooms)
     blocks = indexing.build_catalog(doc, inserts)
     done += BLOCKS
     assigned_keys = {
@@ -917,6 +920,7 @@ def build_first_index(
         "rooms": rooms,
         "equipment": equipment,
         "equipment_unassigned": unassigned,
+        "texts": texts,
         "changelog": "sqlite:changelogs",
     }
     root.mkdir(parents=True, exist_ok=True)

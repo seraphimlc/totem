@@ -509,14 +509,31 @@ def _equip_label(e: dict[str, Any]) -> str:
     return str(name)
 
 
+def _split_furniture(items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    furn, rest = [], []
+    for e in items:
+        (furn if indexing.is_furniture(e) else rest).append(e)
+    return furn, rest
+
+
+def _furniture_summary_line(items: list[dict[str, Any]]) -> str:
+    counts = Counter(_equip_label(e) for e in items)
+    summary = "、".join(f"{n}×{c}" for n, c in counts.most_common(8))
+    return f"  家具 {len(items)} 套：{summary}"
+
+
 def _equipment_lines(room: dict[str, Any], *, full: bool) -> list[str]:
     items = room.get("equipment_nearby") or []
     labels = room.get("labels_nearby") or []
     lines: list[str] = []
-    if items:
+    furn, rest = _split_furniture(items)
+    if furn:
+        lines.append(_furniture_summary_line(furn))
+    listed = rest if furn else items
+    if listed:
         if full:
-            lines.append(f"  设备（{len(items)} 条，坐标为世界坐标）：")
-            for e in items:
+            lines.append(f"  设备（{len(listed)} 条，坐标为世界坐标）：")
+            for e in listed:
                 bit = (
                     f"  - {_equip_label(e)}  坐标={e.get('xy')}  旋转={e.get('rot')}  "
                     f"图层={e.get('layer') or ''}"
@@ -535,9 +552,9 @@ def _equipment_lines(room: dict[str, Any], *, full: bool) -> list[str]:
                     bit += f"  属性={e.get('attribs')}"
                 lines.append(bit)
         else:
-            counts = Counter(_equip_label(e) for e in items)
+            counts = Counter(_equip_label(e) for e in listed)
             summary = "、".join(f"{n}×{c}" for n, c in counts.most_common(8))
-            lines.append(f"  设备 {len(items)} 条：{summary}")
+            lines.append(f"  设备 {len(listed)} 条：{summary}")
     if full and labels:
         lines.append("  附近文字：")
         for lab in labels[:20]:
@@ -552,7 +569,7 @@ def _equipment_lines(room: dict[str, Any], *, full: bool) -> list[str]:
 
 def excerpt_index(proj: dict[str, Any], region: dict[str, Any], user_text: str, *, max_chars: int = 12000) -> str:
     """Send a tight INDEX excerpt: current sheet/rooms/related blocks, never the changelog."""
-    index = load_index(proj)
+    index = indexing.relabel_index(load_index(proj) or {})
     lines: list[str] = []
     meta = index.get("project") or {}
     if isinstance(meta, str):
@@ -597,13 +614,44 @@ def excerpt_index(proj: dict[str, Any], region: dict[str, Any], user_text: str, 
                 f"分图：{name} 包围盒={_bbox(sub.get('frame'))} 比例={sub.get('scale')}"
             )
 
-    tokens = _tokens(user_text)
+    tokens = indexing._query_tokens(user_text)
+    furn_items: list[dict[str, Any]] = []
+    if indexing.is_furniture_query(user_text):
+        furn_items = indexing.furniture_on_sheet(index, region, prefer_dining=True, limit=80)
+        if furn_items:
+            sheet_all = indexing.furniture_on_sheet(index, region, prefer_dining=True, limit=10000)
+            lines.extend(
+                indexing.format_furniture_inventory(furn_items, total=len(sheet_all))
+            )
     # Pull matching fixtures from the full equipment list (including nested ones).
     hits = indexing.search_equipment(index, user_text, region=region, limit=40)
+    furn_keys = {indexing._equipment_key(e) for e in furn_items}
+    hits = [e for e in hits if indexing._equipment_key(e) not in furn_keys]
     if hits:
         lines.append(f"本图幅匹配设备（{len(hits)} 条，含底图块内嵌套符号；坐标为世界坐标）：")
         for e in hits:
             lines.append("  " + indexing.format_equipment_line(e))
+
+    text_hits = indexing.search_texts(index, user_text, region=region, limit=40)
+    if not text_hits:
+        text_hits = indexing.texts_on_sheet(index, region, limit=24)
+    elif tokens:
+        # Keep a few other sheet annotations so notes aren't lost when one phrase hits.
+        extra = [t for t in indexing.texts_on_sheet(index, region, limit=24) if t not in text_hits]
+        text_hits = text_hits + extra
+        seen_t: set[tuple] = set()
+        uniq: list[dict] = []
+        for t in text_hits:
+            key = (t.get("text"), tuple(t.get("xy") or []), t.get("sheet"))
+            if key in seen_t:
+                continue
+            seen_t.add(key)
+            uniq.append(t)
+        text_hits = uniq[:48]
+    if text_hits:
+        lines.append(f"本图幅相关文字（{len(text_hits)} 条，坐标为世界坐标；原文照录）：")
+        for t in text_hits:
+            lines.append("  " + indexing.format_text_line(t))
 
     rooms = index.get("rooms") or []
     # Prefer rooms on this sheet/floor, then ones matching the query
@@ -658,7 +706,7 @@ def excerpt_index(proj: dict[str, Any], region: dict[str, Any], user_text: str, 
 
     blocks = index.get("blocks") or []
     wanted_names = set(tokens)
-    for staple in ("地漏", "马桶", "洗手盆", "清扫口", "地漏DL", "dilou", "消火栓", "蹲便", "坐便", "座便", "便器", "小便", "台盆", "淋浴", "洁具"):
+    for staple in ("地漏", "马桶", "洗手盆", "清扫口", "地漏DL", "dilou", "消火栓", "蹲便", "坐便", "座便", "便器", "小便", "台盆", "淋浴", "洁具", "餐桌", "餐椅", "桌子", "椅子", "桌椅", "家具", "四人桌"):
         wanted_names.add(staple)
     picked_blocks = []
     for b in blocks:

@@ -12,7 +12,7 @@ SYSTEM_PROMPT = """你是建筑与给排水 CAD 助手。用户会围绕当前�
 - 一句话里既有问题又有改图要求时，mode 用 plan，先在 reply 里用一两句回答，再给出方案。
 - 结合此前对话理解指代（「它」「再往左一点」「刚才那个」）。
 - 只有用户明确要求把已有改图方案写入工作图（例如点「确认」或说「按这个改到工作图」）或要求撤回时，才由系统处理，你不必输出方案。
-- 如果上一轮只是建议或点评、还没有改动数组，用户说「可以」「可以的」「好的」「就按这个调整」，这是让你现在给出改图方案：mode 必须用 plan，并填写改动数组。不要只口头答应，也不要当成已经写入图纸。
+- 如果上一轮只是建议或点评、还没有改动数组，用户说「可以」「可以的」「好的」「就按这个调整」「开始做吧」「我同意你的方案」，这是让你现在给出改图方案：mode 必须用 plan，并填写改动数组。不要只口头答应，也不要当成已经写入图纸。
 - 用户问进度、做完了没有、能不能做：这是在问当前改图进展，mode 用 answer，不要当成闲聊拒绝。若用户已确认改进方向但还没有改动数组，应立即补出 mode=plan 的方案。
 - 用户说没看到预览、预览没有变化、还是原来的台盆、是不是还在渲染：这是在问右侧图面有没有更新，仍算当前图纸相关。若改图方案已经给出，不要再输出一份没有改动数组的口头答复，也不要假装重新出方案；应提示用户看右侧局部预览，并指明新增或改动的位置。若还没有改动数组，应立即补出 mode=plan 的方案。
 - 只讨论当前图纸及与改图直接相关的内容。天气、新闻、闲聊、写代码、政治、医疗等与这张图无关的话题：mode 用 reject，reply 用一两句中文拒绝，明确说图腾只讨论当前图纸，inserts/deletes/replaces/moves/pipes/texts 必须是空数组。进度询问、能否改图、以及针对上一轮建议的简短确认，都算当前图纸相关，不要 reject。
@@ -219,8 +219,22 @@ _OFFTOPIC_HINT_RE = re.compile(
     r"(天气|新闻|股市|股价|诗歌|笑话|政治|看病|写代码|Python|JavaScript)"
 )
 _AGREE_RE = re.compile(
-    r"^\s*(可以的?|好的|行|对|嗯|就这样|那就这样|就按这个(?:调整|改|做|来)?|"
-    r"按你说的(?:来|做|改)?|按这个来)[。．\.！!]*\s*$"
+    r"^\s*(?:"
+    r"可以的?|"
+    r"好的|"
+    r"行|"
+    r"对|"
+    r"嗯|"
+    r"就这样|"
+    r"那就这样|"
+    r"就按这个(?:调整|改|做|来)?|"
+    r"按你说的(?:来|做|改)?|"
+    r"按这个来|"
+    r"(?:那)?(?:就)?开始(?:做|改)(?:吧|了)?|"
+    r"开始吧|"
+    r"(?:可以的?[。．\.！! ]*)?(?:我)?同意(?:你的|这个|该)?方案|"
+    r"(?:就)?按你的方案(?:来|做|改|执行)?(?:吧)?"
+    r")[。．\.！!]*\s*$"
 )
 _PROGRESS_RE = re.compile(
     r"(怎么样了|怎样了|如何了|做完了吗|改完了吗|改了吗|做好了吗|弄好了吗|进度)"
@@ -235,6 +249,8 @@ def is_session_followup(text: str) -> bool:
     if _OFFTOPIC_HINT_RE.search(t) and not _AGREE_RE.match(t):
         return False
     if _SHORT_FOLLOWUP_RE.match(t):
+        return True
+    if is_short_agreement(t):
         return True
     if len(t) <= 80 and _PROGRESS_OR_CAPABILITY_RE.search(t):
         return True
@@ -286,13 +302,30 @@ def awaiting_plan_after_suggestion(messages: list[dict[str, Any]]) -> bool:
         if plan_has_edits(plan) or mode == "plan":
             return False
         if mode == "reject":
+            text = (m.get("text") or "").strip()
+            # A failed plan attempt still awaits a real plan once the user agrees.
+            if any(s in text for s in ("尚无法", "无法生成", "做不了", "缺少", "找不到", "可靠的删除")):
+                return True
             continue
         text = (m.get("text") or "").strip()
         if mode == "critique":
             return True
-        if mode == "answer" and any(
-            s in text for s in ("可以吗", "确认后再", "您确认后", "等您确认", "就按这个", "就按")
-        ):
+        suggest_hints = (
+            "可以吗",
+            "确认后再",
+            "您确认后",
+            "等您确认",
+            "就按这个",
+            "就按",
+            "建议",
+            "方案",
+            "减少",
+            "删掉",
+            "抽掉",
+            "加密",
+            "密度",
+        )
+        if mode == "answer" and any(s in text for s in suggest_hints):
             return True
         if mode == "answer":
             continue
