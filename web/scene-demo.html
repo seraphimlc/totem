@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>图腾 · 图面演示</title>
+  <link rel="stylesheet" href="/static/styles.css?v=20261114-14" />
+  <style>
+    body { height: 100vh; }
+    .demo {
+      display: grid;
+      grid-template-columns: 280px 1fr;
+      height: 100%;
+    }
+    .demo-rail {
+      border-right: 1px solid var(--ink);
+      background: var(--paper);
+      padding: 18px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      min-width: 0;
+    }
+    .demo-rail h1 {
+      font-family: var(--font-display);
+      font-size: 18px;
+      margin: 0;
+    }
+    .demo-rail p { margin: 0; color: var(--rule); font-size: 13px; }
+    .demo-rail .btn-solid, .demo-rail .btn-ghost { width: 100%; text-align: center; }
+    .demo-stage-wrap {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      min-height: 0;
+      background: var(--field);
+    }
+    .demo-stage-wrap .preview-stage { flex: 1; }
+    .demo-meta { font-size: 12px; color: var(--cyan); min-height: 3em; }
+  </style>
+</head>
+<body>
+  <div class="demo">
+    <aside class="demo-rail">
+      <p class="wordmark" style="margin:0">图腾</p>
+      <h1>网页图面演示</h1>
+      <p>二层卫排水详图。左侧按钮会直接改右侧矢量图面，不经过 PNG 出图。没有命令栏。</p>
+      <button type="button" class="btn-solid" id="btn-load">加载图面</button>
+      <button type="button" class="btn-ghost" id="btn-seat">8 个蹲便改为坐便</button>
+      <button type="button" class="btn-ghost" id="btn-seven">改为 7 个坐便</button>
+      <button type="button" class="btn-ghost" id="btn-reset">恢复改前图面</button>
+      <p class="demo-meta" id="demo-meta">先加载图面，再试改图。</p>
+      <p>滚轮缩放，拖动画布，双击复位。确认写入图纸仍走工作台原有流程。</p>
+    </aside>
+    <div class="demo-stage-wrap">
+      <div class="preview-toolbar">
+        <p class="preview-note" id="demo-note">万商城 / 二层卫排水详图</p>
+      </div>
+      <div class="preview-stage" id="preview-stage">
+        <p id="preview-empty" class="preview-empty">还没有图面。请先点「加载图面」。</p>
+        <img id="preview-image" alt="" hidden />
+        <div id="scene-view" class="scene-view" hidden>
+          <svg id="scene-svg" xmlns="http://www.w3.org/2000/svg">
+            <defs id="scene-defs"></defs>
+            <g id="scene-world">
+              <g id="scene-base"></g>
+              <g id="scene-patch"></g>
+            </g>
+          </svg>
+          <div id="scene-stamp" class="scene-stamp" hidden></div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <script src="/static/scene.js?v=20261114-14"></script>
+  <script>
+    const META = document.getElementById("demo-meta");
+    const NOTE = document.getElementById("demo-note");
+    const FIX = "/static/scene-fixtures";
+
+    async function loadJson(name) {
+      const res = await fetch(`${FIX}/${name}`, { cache: "no-store" });
+      if (!res.ok) throw new Error("找不到演示数据。请先在本地运行 scripts/test_scene.py。");
+      return res.json();
+    }
+
+    function ready() {
+      TutanScene.mount(document.getElementById("preview-stage"));
+    }
+
+    document.getElementById("btn-load").addEventListener("click", async () => {
+      META.textContent = "正在加载图面…";
+      try {
+        const scene = await loadJson("base.json");
+        TutanScene.load(scene);
+        const c = scene.counts || {};
+        META.textContent = `已加载。符号 ${c.symbols || 0} 个，插入 ${c.inserts || 0} 处，图元 ${c.items || 0}。`;
+        NOTE.textContent = "万商城 / 二层卫排水详图（当前图纸）";
+      } catch (err) {
+        META.textContent = err.message || "加载失败。";
+      }
+    });
+
+    async function applyNamed(file, label) {
+      META.textContent = "正在更新图面…";
+      const t0 = performance.now();
+      try {
+        if (!TutanScene.hasScene()) {
+          const scene = await loadJson("base.json");
+          TutanScene.load(scene);
+        }
+        const patch = await loadJson(file);
+        TutanScene.applyPatch(patch, { pending: true, stamp: patch.stamp || "方案预览，尚未写入工作图" });
+        const ms = Math.round(performance.now() - t0);
+        const a = (patch.actions) || {};
+        META.textContent = `${label}。覆盖 ${a.cover || 0} 处，新增 ${a.insert || 0} 处。页面更新 ${ms} 毫秒。尚未写入工作图。`;
+        NOTE.textContent = "万商城 / 二层卫排水详图（方案预览）";
+      } catch (err) {
+        META.textContent = err.message || "更新失败。";
+      }
+    }
+
+    document.getElementById("btn-seat").addEventListener("click", () => applyNamed("patch-8seat.json", "已把 8 个蹲便改为坐便"));
+    document.getElementById("btn-seven").addEventListener("click", () => applyNamed("patch-8to7.json", "已改为 7 个坐便"));
+    document.getElementById("btn-reset").addEventListener("click", async () => {
+      try {
+        const scene = await loadJson("base.json");
+        TutanScene.load(scene);
+        META.textContent = "已恢复改前图面。";
+        NOTE.textContent = "万商城 / 二层卫排水详图（当前图纸）";
+      } catch (err) {
+        META.textContent = err.message || "恢复失败。";
+      }
+    });
+
+    ready();
+  </script>
+</body>
+</html>

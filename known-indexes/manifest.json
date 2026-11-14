@@ -1,0 +1,24 @@
+{
+  "schema": "cad-nl-known-indexes/v1",
+  "drawings": [
+    {
+      "id": "xueshengshitang",
+      "name": "学生食堂",
+      "sha256": "987d6ad0a768b459e7629a14e66473ebb15ea98c7d89d8a728aef450b5a9dce3",
+      "encoding": "utf-8",
+      "dxf_version": "AC1021",
+      "default_sheet": "1F-装饰平面布置图",
+      "index_dir": "xueshengshitang"
+    },
+    {
+      "id": "wanshangcheng",
+      "name": "万商城3号楼给排水",
+      "sha256": "8009c743b9f95813b08ef7ea2a87919fd4e9b975a9cc5f810b609d2f24175d0e",
+      "encoding": "gbk",
+      "dxf_version": "AC1021",
+      "default_sheet": "水施-007",
+      "default_subview": "二层卫排水详图",
+      "index_dir": "wanshangcheng"
+    }
+  ]
+}

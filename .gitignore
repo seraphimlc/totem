@@ -1,0 +1,18 @@
+.env
+.access_password
+.venv/
+venv/
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.DS_Store
+var/
+web/fonts/*.ttf
+*.egg-info/
+.python-version
+
+# Local session / index database
+data/
+*.bak*

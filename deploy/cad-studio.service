@@ -1,0 +1,17 @@
+[Unit]
+Description=图腾 CAD workbench
+After=network.target
+
+[Service]
+Type=simple
+User=cad
+Group=cad
+WorkingDirectory=/opt/cad-studio/current
+EnvironmentFile=/opt/cad-studio/.env
+ExecStart=/opt/cad-studio/current/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8780 --workers 1
+Restart=on-failure
+RestartSec=3
+# Single worker: DXF documents stay in process memory.
+
+[Install]
+WantedBy=multi-user.target

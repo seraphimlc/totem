@@ -1,0 +1,24 @@
+.env
+.access_password
+.venv/
+venv/
+__pycache__/
+*.pyc
+.git/
+var/
+*.egg-info/
+.pytest_cache/
+node_modules/
+preview-ui.png
+preview-login.png
+# project extras that must not be packed (also listed in pack.sh filters)
+source.dwg
+*.dwg
+*.pdf
+*.zip
+libs/
+tmp/
+ref/
+dxf/
+scripts/
+preview/

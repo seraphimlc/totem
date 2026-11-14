@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>图腾 · 改图工作台</title>
+  <link rel="stylesheet" href="/static/styles.css?v=20261114-14" />
+</head>
+<body>
+  <div id="login-screen" class="login-screen" hidden>
+    <div class="login-sheet" aria-hidden="true"></div>
+    <div class="titleblock">
+      <div class="titleblock-rule"></div>
+      <p class="wordmark">图腾</p>
+      <p class="subtitle">改图工作台</p>
+      <form id="login-form" action="/api/login" method="post" autocomplete="on">
+        <label class="field">
+          <span>用户名</span>
+          <input id="login-username" name="username" type="text" required maxlength="80" autocomplete="username" />
+        </label>
+        <label class="field">
+          <span>密码</span>
+          <input id="login-password" name="password" type="password" required maxlength="200" autocomplete="current-password" />
+        </label>
+        <p id="login-error" class="form-error" hidden></p>
+        <button type="submit" class="btn-solid" id="login-submit">进入工作台</button>
+      </form>
+      <p class="titleblock-note">内部工作台。使用发给你的账号进入，没有对外注册。</p>
+    </div>
+  </div>
+
+  <div id="workbench" class="workbench" hidden>
+    <header class="topbar">
+      <div class="brand">
+        <span class="wordmark">图腾</span>
+        <span class="subtitle">改图工作台</span>
+      </div>
+      <div class="topbar-project">
+        <span id="current-project-name">未选择项目</span>
+        <span id="current-region-name" class="quiet"></span>
+      </div>
+      <div class="model-toggle" role="radiogroup" aria-label="选用模型">
+        <button type="button" class="model-btn is-on" data-model="Tifa-6.1-sol" role="radio" aria-checked="true">Tifa-6.1-sol</button>
+        <button type="button" class="model-btn" data-model="Tifa-6-astra" role="radio" aria-checked="false">Tifa-6-astra</button>
+      </div>
+      <div class="topbar-user">
+        <span id="who"></span>
+        <button type="button" id="logout-btn" class="btn-ghost">退出</button>
+      </div>
+    </header>
+
+    <aside class="rail" aria-label="会话">
+      <h1>会话</h1>
+      <p class="rail-hint">一份图纸一个会话。可同时开多个，随时切换。新建会话先上传图纸。</p>
+      <div class="rail-actions">
+        <button type="button" class="btn-solid btn-new-session" id="new-session-btn">新建会话</button>
+        <input id="upload-input" type="file" accept=".dwg,.dxf" hidden />
+      </div>
+      <ul id="project-list" class="project-list"></ul>
+    </aside>
+
+    <section class="chat-pane" aria-label="对话">
+      <div id="upload-panel" class="session-panel" hidden>
+        <p class="session-kicker">新建会话</p>
+        <p class="session-title">先上传一张 DWG 或 DXF</p>
+        <p class="session-copy">上传后会先建立索引并准备预览。这个过程结束后，才能开始提问或改图。</p>
+        <label id="upload-drop" class="upload-drop" for="upload-input">
+          <span>把图纸拖到这里，或点击选择文件</span>
+          <span class="quiet">单个文件不超过 80MB</span>
+        </label>
+        <p id="upload-error" class="form-error" hidden></p>
+      </div>
+      <div id="init-panel" class="session-panel" hidden>
+        <p class="session-kicker">正在准备这张图</p>
+        <p class="session-title" id="init-title">建立索引并准备预览</p>
+        <ol id="init-steps" class="init-steps"></ol>
+        <div class="init-progress-row">
+          <div id="init-progress" class="init-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="准备进度">
+            <div id="init-bar" class="init-bar"></div>
+          </div>
+          <span id="init-percent" class="init-percent">0%</span>
+        </div>
+        <p id="init-message" class="session-copy">开始准备。</p>
+        <p id="init-error" class="form-error" hidden></p>
+        <div class="init-actions">
+          <button type="button" class="btn-solid" id="init-continue" hidden>继续准备</button>
+          <button type="button" class="btn-ghost" id="init-retry" hidden>重新准备</button>
+        </div>
+      </div>
+      <div id="chat-log" class="chat-log">
+        <div class="empty-chat" id="chat-empty">
+          准备完成后，可以问这张图里有什么，也可以直接提出改图要求。例如：消毒房里都有什么？
+        </div>
+      </div>
+      <form id="chat-form" class="composer" hidden>
+        <label class="sr-only" for="chat-input">问题或改图要求</label>
+        <textarea id="chat-input" rows="3" maxlength="8000" placeholder="问图纸的问题，或写下要改的地方"></textarea>
+        <div class="composer-row">
+          <p id="chat-status" class="composer-status"></p>
+          <div class="composer-actions">
+            <button type="button" class="btn-ghost" id="apply-btn" hidden>确认写入图纸</button>
+            <button type="button" class="btn-ghost" id="undo-btn" hidden>撤回上一步</button>
+            <a class="btn-ghost" id="download-btn" hidden>下载工作图</a>
+            <button type="submit" class="btn-solid" id="chat-submit">发送</button>
+          </div>
+        </div>
+      </form>
+    </section>
+
+    <section class="preview-pane" aria-label="图面">
+      <div class="preview-toolbar">
+        <label class="field region-field">
+          <span>图幅与分区</span>
+          <select id="region-select"></select>
+        </label>
+        <div class="preview-tools">
+          <button type="button" class="btn-ghost" id="view-scene-btn" hidden>图面</button>
+          <button type="button" class="btn-ghost" id="view-image-btn" hidden>图片</button>
+          <button type="button" class="btn-ghost" id="view-work-btn" hidden>看工作图</button>
+          <button type="button" class="btn-ghost" id="view-official-btn" hidden>看原图</button>
+          <button type="button" class="btn-ghost" id="pdf-btn" hidden>导出PDF</button>
+          <span class="zoom-controls" id="zoom-controls" hidden>
+            <button type="button" class="btn-ghost" id="zoom-out-btn" title="缩小">−</button>
+            <button type="button" class="btn-ghost" id="zoom-in-btn" title="放大">+</button>
+            <button type="button" class="btn-ghost" id="zoom-reset-btn">复位</button>
+            <span id="zoom-label" class="quiet">100%</span>
+          </span>
+        </div>
+        <p id="preview-note" class="preview-note">方案一出，右侧直接显示改后效果。确认后写入当前图纸，并可撤回。</p>
+      </div>
+      <div class="preview-stage" id="preview-stage">
+        <p id="preview-empty" class="preview-empty">新建会话并上传图纸，或从左侧切换到一个已有会话。</p>
+        <img id="preview-image" alt="图纸局部预览" hidden />
+        <div id="scene-view" class="scene-view" hidden>
+          <svg id="scene-svg" xmlns="http://www.w3.org/2000/svg" aria-label="图纸图面">
+            <defs id="scene-defs"></defs>
+            <g id="scene-world">
+              <g id="scene-base"></g>
+              <g id="scene-patch"></g>
+            </g>
+          </svg>
+          <div id="scene-stamp" class="scene-stamp" hidden></div>
+        </div>
+        <p id="preview-error" class="form-error" hidden></p>
+        <div id="preview-loading" class="preview-loading" hidden>正在出图…</div>
+      </div>
+    </section>
+  </div>
+
+  <script src="/static/scene.js?v=20261114-14"></script>
+  <script src="/static/app.js?v=20261114-14"></script>
+</body>
+</html>

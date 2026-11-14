@@ -1,0 +1,29 @@
+{
+  "projects": [
+    {
+      "id": "xueshengshitang",
+      "name": "学生食堂",
+      "root_env": "CAD_PROJECT_XUESHENGSHITANG",
+      "default_root": "/workspace/cad-nl/projects/学生食堂",
+      "data_subdir": "学生食堂",
+      "deliverable": "out/学生食堂-1F装饰平面-卫生间已改.dxf",
+      "encoding": "utf-8",
+      "dxf_version": "AC1021",
+      "default_sheet": "1F-装饰平面布置图",
+      "note": "装饰施工图。预览默认用当前索引里的 SBB 实测图框，不要用旧的 SHEET_1F 近似值。"
+    },
+    {
+      "id": "wanshangcheng",
+      "name": "万商城3号楼给排水",
+      "root_env": "CAD_PROJECT_WANSHANGCHENG",
+      "default_root": "/workspace/cad-nl/demo-t53",
+      "data_subdir": "万商城3号楼给排水",
+      "deliverable": "out/万商城3号楼-给排水施工图-演示改图.dxf",
+      "encoding": "utf-8",
+      "dxf_version": "AC1021",
+      "default_sheet": "水施-007",
+      "default_subview": "二层卫排水详图",
+      "note": "原目录是 demo-t53，不要移动。交付图是 UTF-8 AC1021。"
+    }
+  ]
+}
