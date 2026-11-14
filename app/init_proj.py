@@ -614,22 +614,33 @@ def convert_dwg(src: Path, dest: Path) -> Path:
     tmp_src = tmp_dir / src.name
     shutil.copy2(src, tmp_src)
     import subprocess
-    cmd = [tool, "-y", "-o", str(tmp_dir), str(tmp_src)]
-    # Some builds only accept the input path.
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180
+
+    def _run(argv):
+        return subprocess.run(
+            argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180
         )
-    except Exception:
-        proc = subprocess.run(
-            [tool, str(tmp_src)], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180
-        )
-    produced = list(tmp_dir.glob("*.dxf")) + list(tmp_dir.glob("*.DXF"))
-    if not produced:
-        raise ValueError("DWG 转换没有成功。请改传 DXF，或检查原文件是否完好。")
-    shutil.copy2(produced[0], dest)
+
+    # dwg2dxf takes the output *file* with -o, not a directory, and it can exit 0
+    # while printing "WRITE ERROR", so the artefact is the only proof of success.
+    out_dxf = tmp_dir / "source.dxf"
+    if out_dxf.exists():
+        out_dxf.unlink()
+    proc = _run([tool, "-y", "-o", str(out_dxf), str(tmp_src)])
+    if not (out_dxf.is_file() and out_dxf.stat().st_size > 0):
+        # Some builds only accept the input path and write next to it.
+        proc = _run([tool, "-y", str(tmp_src)])
+        produced = sorted(tmp_dir.glob("*.dxf")) + sorted(tmp_dir.glob("*.DXF"))
+        if not produced:
+            detail = ((proc.stderr or "") + (proc.stdout or "")).strip().splitlines()
+            hint = detail[-1] if detail else "没有输出"
+            raise ValueError("DWG 转换没有成功（%s）。请改传 DXF，或检查原文件是否完好。" % hint)
+        out_dxf = produced[0]
+    shutil.copy2(out_dxf, dest)
     shutil.rmtree(tmp_dir, ignore_errors=True)
-    # Normalize to AC1021 when possible.
+    # Normalize to UTF-8 when possible. ezdxf can choke on tables produced by
+    # dwg2dxf, and a failed saveas truncates whatever file it is writing, so the
+    # normalized copy goes to a scratch file and only replaces dest on success.
+    norm_tmp = dest.with_name(dest.name + ".normalize.tmp")
     try:
         doc = ezdxf.readfile(str(dest))
         try:
@@ -639,18 +650,15 @@ def convert_dwg(src: Path, dest: Path) -> Path:
                 log.info("sanitized %s corrupt text backgrounds in %s", n, dest)
         except Exception:
             log.exception("could not sanitize text backgrounds in %s", dest)
-        doc.saveas(str(dest), encoding="utf-8")
+        doc.saveas(str(norm_tmp), encoding="utf-8")
+        norm_tmp.replace(dest)
     except Exception:
+        log.exception("could not normalize converted dxf, keeping the raw conversion")
         try:
-            doc = ezdxf.readfile(str(dest), encoding="gbk")
-            try:
-                from . import cad_render
-                cad_render.sanitize_doc_text_backgrounds(doc)
-            except Exception:
-                pass
-            doc.saveas(str(dest))
-        except Exception:
-            log.exception("could not normalize converted dxf")
+            if norm_tmp.exists():
+                norm_tmp.unlink()
+        except OSError:
+            pass
     return dest
 
 
