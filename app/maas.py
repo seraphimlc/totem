@@ -21,6 +21,11 @@ class MaasError(Exception):
         self.retryable_without_image = retryable_without_image
 
 
+# Default 30s also applied to writes and caused furniture+preview posts to fail
+# with httpx.WriteTimeout (~30s after JEV). Keep a long read for generation.
+REQUEST_TIMEOUT = httpx.Timeout(connect=15.0, write=120.0, read=180.0, pool=30.0)
+
+
 def _headers() -> dict[str, str]:
     if not config.MAAS_KEY:
         raise MaasError("服务器还没有配置模型接口密钥。请在 .env 里设置 MAAS_KEY 后重启。")
@@ -111,13 +116,20 @@ async def complete(
         "temperature": temperature,
         "stream": stream,
     }
-    timeout = httpx.Timeout(30.0, read=180.0, connect=15.0)
+    timeout = REQUEST_TIMEOUT
     async with httpx.AsyncClient(timeout=timeout) as client:
         if stream:
             try:
                 async for ev in _stream(client, payload):
                     yield ev
                 return
+            except httpx.WriteTimeout as exc:
+                if image_data_url:
+                    raise MaasError(
+                        "上传预览超时。",
+                        retryable_without_image=True,
+                    ) from exc
+                raise
             except MaasError as exc:
                 if exc.retryable_without_image:
                     raise

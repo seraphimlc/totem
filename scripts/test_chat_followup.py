@@ -49,6 +49,14 @@ def test_followups():
     check("confirm is apply", detect_intent("确认") == "apply")
     check("可以的 is not apply", detect_intent("可以的") is None)
     check("可以的 is agreement", is_short_agreement("可以的"))
+    check("开始做吧 is not apply", detect_intent("开始做吧") is None)
+    check("开始做吧 is agreement", is_short_agreement("开始做吧"))
+    check("开始做吧 is followup", is_session_followup("开始做吧"))
+    check("同意方案 is not apply", detect_intent("可以。我同意你的方案") is None)
+    check("同意方案 is agreement", is_short_agreement("可以。我同意你的方案"))
+    check("同意方案 is followup", is_session_followup("可以。我同意你的方案"))
+    check("我同意你的方案 is agreement", is_short_agreement("我同意你的方案"))
+    check("怎么样了 still followup", is_session_followup("怎么样了"))
     check("long policy is not short agreement", not is_short_agreement(
         "可以的，那就不要硬放四个了。后面再有这种不合理的情况，你可以给出建议的。我确认后再做。可以吗？"
     ))
@@ -63,6 +71,23 @@ def test_plan_nudge():
         "plan": {"mode": "critique", "inserts": [], "replaces": [], "moves": []},
     }
     check("nudge after 可以的", bool(plan_nudge_for("可以的", [critique])))
+    check("nudge after 开始做吧", bool(plan_nudge_for("开始做吧", [critique])))
+    check("nudge after 可以。我同意你的方案", bool(plan_nudge_for("可以。我同意你的方案", [critique])))
+    suggestion = {
+        "role": "assistant",
+        "mode": "answer",
+        "text": "餐厅餐桌密度偏高，建议抽掉一部分，先从靠南墙的一排减起。",
+        "plan": {"mode": "answer", "inserts": [], "deletes": []},
+    }
+    check("nudge after density suggestion + 开始做吧", bool(plan_nudge_for("开始做吧", [suggestion])))
+    check("nudge after density suggestion + 同意方案", bool(plan_nudge_for("可以。我同意你的方案", [suggestion])))
+    failed = {
+        "role": "assistant",
+        "mode": "reject",
+        "text": "尚无法生成可靠的删除项及局部预览。",
+        "plan": {"mode": "reject", "deletes": []},
+    }
+    check("nudge after failed delete + 开始做吧", bool(plan_nudge_for("开始做吧", [failed])))
     ack = {
         "role": "assistant",
         "mode": "answer",

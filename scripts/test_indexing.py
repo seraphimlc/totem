@@ -117,7 +117,142 @@ def test_library_search_seated() -> None:
         _ok("library-real-block-name", all(b.get("name") for b in hits))
 
 
+def test_drawing_texts_in_index_and_excerpt() -> None:
+    """TEXT/MTEXT/ATTRIB and anonymous-block labels must be stored and excerpted."""
+    import ezdxf
+    from app import indexing, projects
+
+    _ok(
+        "clean-color-mtext",
+        indexing._clean_dxf_text(r"{\C50; 餐厅}") == "餐厅",
+        indexing._clean_dxf_text(r"{\C50; 餐厅}"),
+    )
+    _ok(
+        "clean-font-mtext",
+        "双孔回收台带车" in indexing._clean_dxf_text(
+            r"{\fSimHei|b0|i0|c134|p49;双孔回收台带车\P1800*700*800}"
+        ),
+        indexing._clean_dxf_text(r"{\fSimHei|b0|i0|c134|p49;双孔回收台带车\P1800*700*800}"),
+    )
+    _ok(
+        "query-score-occupancy",
+        indexing._text_query_score("一层使用人数：390人", "一层使用人数是多少", ["一层使用人数是多少"]) >= 6,
+    )
+
+    doc = ezdxf.new("R2010")
+    msp = doc.modelspace()
+    msp.add_lwpolyline(
+        [(0, 0), (20000, 0), (20000, 15000), (0, 15000)],
+        close=True,
+        dxfattribs={"layer": "000PL"},
+    )
+    msp.add_text("备餐间", dxfattribs={"insert": (4000, 6000), "height": 300, "layer": "房间功能"})
+    msp.add_text(
+        "三孔回收台带车",
+        dxfattribs={"insert": (4300, 5200), "height": 180, "layer": "0"},
+    )
+    msp.add_mtext(
+        "一层使用人数：390人",
+        dxfattribs={"insert": (2000, 12000), "char_height": 200, "layer": "0标注"},
+    )
+    # Formatted MTEXT like the cafeteria drawing: color / font groups must not eat wording.
+    msp.add_mtext(
+        r"{\C50; 餐厅}",
+        dxfattribs={"insert": (3500, 6100), "char_height": 300, "layer": "WINDOW"},
+    )
+    msp.add_mtext(
+        r"{\fSimHei|b0|i0|c134|p49;双孔回收台带车\P1800*700*800}",
+        dxfattribs={"insert": (5000, 3000), "char_height": 120, "layer": "RAWEN设备名称"},
+    )
+    # ATTRIB on a named block insert
+    blk = doc.blocks.new("EQ_TAG")
+    blk.add_attdef(tag="NAME", text="设备", dxfattribs={"insert": (0, 200), "height": 100})
+    ins = msp.add_blockref("EQ_TAG", insert=(8000, 6000), dxfattribs={"layer": "0"})
+    ins.add_attrib("NAME", "压面机", dxfattribs={"insert": (8000, 6200), "height": 100})
+    # Text inside an anonymous * block (equipment collection skips these)
+    try:
+        anon = doc.blocks.new("*U99")
+        anon.add_text("防烟分区", dxfattribs={"insert": (0, 0), "height": 150, "layer": "0"})
+        msp.add_blockref("*U99", insert=(9000, 4000), dxfattribs={"layer": "0"})
+        have_anon = True
+    except Exception as exc:
+        have_anon = False
+        print(f"note: could not create *U99 anonymous block ({exc})")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        from app import config, db, init_proj
+
+        prev_data = config.CAD_DATA_DIR
+        db.close()
+        config.CAD_DATA_DIR = tmp
+        db.close()
+        try:
+            path = Path(tmp) / "ann.dxf"
+            doc.saveas(str(path), encoding="utf-8")
+            root = Path(tmp) / "proj"
+            index = init_proj.build_first_index(path, root, "标注测试图", project_id="test-texts")
+            stored = db.load_index("test-texts")
+            _ok("sqlite-stores-texts", stored == index)
+        finally:
+            db.close()
+            config.CAD_DATA_DIR = prev_data
+
+    texts = index.get("texts") or []
+    words = {str(t.get("text") or "") for t in texts}
+    _ok("index-has-texts-field", isinstance(texts, list) and len(texts) >= 3, str(len(texts)))
+    _ok("has-room-text", "备餐间" in words, str(sorted(words)))
+    _ok("has-recycle-counter", "三孔回收台带车" in words, str(sorted(words)))
+    _ok("has-occupancy-note", any("一层使用人数" in w and "390" in w for w in words), str(sorted(words)))
+    _ok("has-formatted-dining-room", any(w.strip() == "餐厅" for w in words), str(sorted(words)))
+    _ok("has-formatted-recycle-mtext", any("回收台带车" in w for w in words), str(sorted(words)))
+    _ok("formatted-mtext-not-font-preamble", not any("SimHei" in w or w.startswith("fSim") for w in words), str(sorted(words)))
+    _ok("has-attrib-press", any("压面机" in w for w in words), str(sorted(words)))
+    if have_anon:
+        _ok("has-anon-block-text", "防烟分区" in words, str(sorted(words)))
+
+    rooms = {r["name"]: r for r in index.get("rooms") or []}
+    _ok("room-beican", "备餐间" in rooms, str(list(rooms)))
+    labels = rooms.get("备餐间", {}).get("labels_nearby") or []
+    label_words = [it.get("text") if isinstance(it, dict) else str(it) for it in labels]
+    _ok("room-labels-include-recycle", any("回收台" in w for w in label_words), str(label_words))
+
+    # Enriching again must not drop rooms or already-attached labels.
+    before_rooms = len(index.get("rooms") or [])
+    before_eq = len(index.get("equipment") or [])
+    indexing.apply_texts_to_index(index, list(texts))
+    _ok("reapply-keeps-rooms", len(index.get("rooms") or []) == before_rooms)
+    _ok("reapply-keeps-equipment", len(index.get("equipment") or []) == before_eq)
+    _ok("reapply-keeps-recycle-label", any("回收台" in w for w in [
+        it.get("text") if isinstance(it, dict) else str(it)
+        for it in (rooms.get("备餐间") or index["rooms"][0]).get("labels_nearby") or []
+    ]))
+
+    proj = {"name": "标注测试图", "encoding": "utf-8", "dxf_version": "AC1021"}
+    original = projects.load_index
+    projects.load_index = lambda _p: index  # type: ignore
+    try:
+        region = {
+            "kind": "sheet",
+            "title": index["sheets"][0]["title"] if index.get("sheets") else "标注测试图",
+            "sheet_id": index["sheets"][0]["id"] if index.get("sheets") else "",
+            "bbox": [0, 0, 20000, 15000],
+            "floor": "1F",
+        }
+        ex_recycle = projects.excerpt_index(proj, region, "回收台在哪")
+        ex_people = projects.excerpt_index(proj, region, "一层使用人数是多少")
+        ex_general = projects.excerpt_index(proj, region, "这张图的房间怎么布置")
+    finally:
+        projects.load_index = original
+
+    _ok("excerpt-recycle", "三孔回收台带车" in ex_recycle or "双孔回收台带车" in ex_recycle, ex_recycle)
+    _ok("excerpt-formatted-dining", "餐厅" in ex_recycle or "餐厅" in ex_general, ex_recycle)
+    _ok("excerpt-occupancy", "一层使用人数：390人" in ex_people or "390人" in ex_people, ex_people)
+    _ok("excerpt-sheet-sample-cjk", "备餐间" in ex_general or "三孔回收台带车" in ex_general, ex_general)
+    _ok("excerpt-not-truncated-badly", "本图幅相关文字" in ex_recycle and len(ex_recycle) <= 12000, str(len(ex_recycle)))
+
+
 if __name__ == "__main__":
     test_flatten_and_excerpt()
     test_library_search_seated()
+    test_drawing_texts_in_index_and_excerpt()
     print("ALL PASS")
