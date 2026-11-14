@@ -42,9 +42,18 @@ def project_write_lock(proj: Union[dict[str, Any], str]) -> threading.Lock:
     return _keyed_lock("write", proj)
 
 
+def data_base() -> Path:
+    """Where session folders and sessions.json live.
+
+    Uploads create the session folder under this base, so resolving a session root
+    must use the exact same fallback. Otherwise an unset CAD_DATA_DIR leaves every
+    session without a root and the workbench reports the folder does not exist.
+    """
+    return Path(config.CAD_DATA_DIR) if config.CAD_DATA_DIR else config.STUDIO_ROOT / "data"
+
+
 def sessions_path() -> Path:
-    base = Path(config.CAD_DATA_DIR) if config.CAD_DATA_DIR else config.STUDIO_ROOT / "data"
-    return base / "sessions.json"
+    return data_base() / "sessions.json"
 
 
 def load_sessions() -> list[dict[str, Any]]:
@@ -165,9 +174,13 @@ def _resolve_root(spec: dict[str, Any]) -> Optional[Path]:
         if override:
             return Path(override)
     subdir = spec.get("data_subdir") or ""
-    if config.CAD_DATA_DIR and subdir:
-        candidate = Path(config.CAD_DATA_DIR) / subdir
+    if subdir:
+        candidate = data_base() / subdir
         if candidate.is_dir():
+            return candidate
+        # An uploaded session owns its folder under data_base even before the
+        # preparation step has written anything into it.
+        if (spec.get("kind") or "") == "session":
             return candidate
     default = spec.get("default_root")
     if default:
