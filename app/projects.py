@@ -10,6 +10,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Optional, Union
 
+from . import atomicio
 from . import config
 from . import indexing
 
@@ -90,10 +91,8 @@ def save_session(spec: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     items = [s for s in load_sessions() if s.get("id") != spec["id"]]
     items.insert(0, dict(spec))
-    tmp = path.with_suffix(".tmp")
     payload = {"schema": "cad-nl-studio-sessions/v1", "projects": items}
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    atomicio.write_text_atomic(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
     try:
         from . import db
         db.upsert_session(spec)
@@ -121,12 +120,9 @@ def update_session(project_id: str, fields: dict[str, Any]) -> None:
             pass
         return
     path = sessions_path()
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(
-        json.dumps({"schema": "cad-nl-studio-sessions/v1", "projects": items}, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
+    atomicio.write_text_atomic(
+        path, json.dumps({"schema": "cad-nl-studio-sessions/v1", "projects": items}, ensure_ascii=False, indent=2) + "\n"
     )
-    tmp.replace(path)
     try:
         from . import db
         db.update_session(project_id, fields)
@@ -706,10 +702,7 @@ def _load_chat_unlocked(path: Path) -> dict[str, Any]:
 
 
 def _write_chat_unlocked(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    atomicio.write_text_atomic(path, json.dumps(data, ensure_ascii=False, indent=2))
 
 
 def read_chat(proj: dict[str, Any]) -> dict[str, Any]:

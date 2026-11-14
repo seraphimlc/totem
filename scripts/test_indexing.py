@@ -109,6 +109,14 @@ def test_flatten_and_excerpt() -> None:
 def test_library_search_seated() -> None:
     from app import library
 
+    # The component library index lives next to the drawings on the server; a
+    # machine without it can still run everything else.
+    index = library.index_path()
+    if not index:
+        print("SKIP  component library index not found", flush=True)
+        print("SKIP  set CAD_LIBRARY_INDEX to libraries/default/index.json to run this test", flush=True)
+        return
+
     hits = library.search("坐便") or library.search("座便器") or library.search("马桶")
     names = [b.get("name") for b in hits]
     _ok("library-has-seated", any(n in names or "马桶" in (n or "") or "座便" in str(b.get("display_name")) or "马桶" in str(b.get("display_name")) for b, n in ((b, b.get("name")) for b in hits)) or bool(hits), str(names[:8]))

@@ -16,6 +16,7 @@ from typing import Any, Callable, Optional
 import ezdxf
 from ezdxf import bbox as ezbbox
 
+from . import atomicio
 from . import cad_render, config, known, projects
 from . import indexing
 
@@ -139,7 +140,7 @@ def read_status(proj: dict[str, Any]) -> dict[str, Any]:
             return _normalize_steps(data)
         return default_status()
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(atomicio.read_text_tolerant(path, encoding="utf-8"))
     except Exception:
         return default_status("准备状态读不出来，将重新开始。")
     if not isinstance(data, dict):
@@ -151,9 +152,11 @@ def read_status(proj: dict[str, Any]) -> dict[str, Any]:
 def write_status(proj: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
     data["updated_at"] = _now()
     path = status_path(proj)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    # Progress is rewritten on the next tick, so a locked file is skipped rather
+    # than overwritten in place while the polling endpoint is reading it.
+    atomicio.write_text_atomic(
+        path, json.dumps(data, ensure_ascii=False, indent=2) + "\n", required=False
+    )
     return data
 
 
