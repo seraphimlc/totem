@@ -872,6 +872,76 @@ def stamp_preview(path: Path, text: str) -> Path:
     return path
 
 
+def annotate_changes(
+    path: Path,
+    bbox,
+    dirty,
+    results: Optional[list[dict]] = None,
+) -> Path:
+    """在预览图上把「改哪儿」圈出来：一圈虚线框 + 一个落位点。
+
+    取景扩到能看到周边之后，光看图不知道哪几笔是方案加的，这里补一层标记。
+    """
+    path = Path(path)
+    img = Image.open(path).convert("RGBA")
+    w, h = img.size
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    redline = (181, 74, 58, 235)
+    ochre = (196, 132, 42, 235)
+
+    def _px(x, y):
+        return world_to_pixel(x, y, bbox, w, h, pad=PAD)
+
+    box = None
+    try:
+        dx0, dy0, dx1, dy1 = [float(v) for v in dirty]
+        ax, ay = _px(dx0, dy1)
+        bx, by = _px(dx1, dy0)
+        box = (min(ax, bx), min(ay, by), max(ax, bx), max(ay, by))
+    except Exception:
+        box = None
+
+    width = max(2, w // 600)
+    if box and box[2] - box[0] > 1 and box[3] - box[1] > 1:
+        x0, y0, x1, y1 = box
+        # 虚线框：线段自己算，省得依赖 PIL 的虚线支持。
+        step = max(10, int((x1 - x0) // 24))
+        for x in range(int(x0), int(x1), step * 2):
+            draw.line([(x, y0), (min(x + step, x1), y0)], fill=redline, width=width)
+            draw.line([(x, y1), (min(x + step, x1), y1)], fill=redline, width=width)
+        step_y = max(10, int((y1 - y0) // 24))
+        for y in range(int(y0), int(y1), step_y * 2):
+            draw.line([(x0, y), (x0, min(y + step_y, y1))], fill=redline, width=width)
+            draw.line([(x1, y), (x1, min(y + step_y, y1))], fill=redline, width=width)
+        # 四角加粗，缩小看也能认出来。
+        arm = max(8, min(24, int((x1 - x0) // 6), int((y1 - y0) // 6)))
+        for cx, cy, sx, sy in ((x0, y0, 1, 1), (x1, y0, -1, 1), (x0, y1, 1, -1), (x1, y1, -1, -1)):
+            draw.line([(cx, cy), (cx + arm * sx, cy)], fill=redline, width=width + 1)
+            draw.line([(cx, cy), (cx, cy + arm * sy)], fill=redline, width=width + 1)
+
+    # 落位点：每个写进去的插入/移动画一个小十字，防止框里有多处改动时找不到。
+    for res in results or []:
+        if not res.get("ok"):
+            continue
+        xy = res.get("xy") if res.get("action") in {"insert", "cover", "replace"} else res.get("to")
+        if not xy or len(xy) < 2:
+            continue
+        try:
+            px, py = _px(float(xy[0]), float(xy[1]))
+        except Exception:
+            continue
+        r = max(4, w // 200)
+        draw.line([(px - r, py), (px + r, py)], fill=ochre, width=width)
+        draw.line([(px, py - r), (px, py + r)], fill=ochre, width=width)
+
+    out = Image.alpha_composite(img, overlay).convert("RGB")
+    tmp = path.with_suffix(".mark.png")
+    out.save(tmp, "PNG", optimize=True)
+    tmp.replace(path)
+    return path
+
+
 def render_doc_preview(doc, bbox, dest: Path, *, dpi=None, stamp: Optional[str] = None) -> Path:
     """Render an in-memory DXF crop. Does not touch the source path cache."""
     dest = Path(dest)

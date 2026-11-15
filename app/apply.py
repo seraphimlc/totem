@@ -22,7 +22,7 @@ import ezdxf
 from ezdxf import bbox as ezbbox
 from ezdxf.math import Matrix44, Vec3
 
-from . import config, library, projects
+from . import config, library, placement, projects
 
 log = logging.getLogger("cad-studio.apply")
 
@@ -595,13 +595,30 @@ def _choose_rotation(doc, item: dict[str, Any], found: Optional[dict[str, Any]],
     return 0.0
 
 
-def _add_insert(doc, msp, item: dict[str, Any], layer: str, bbox, *, found: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+def _add_insert(
+    doc,
+    msp,
+    item: dict[str, Any],
+    layer: str,
+    bbox,
+    *,
+    found: Optional[dict[str, Any]] = None,
+    region: Optional[dict[str, Any]] = None,
+    index: Optional[dict[str, Any]] = None,
+    snap_kind: str = "insert",
+) -> dict[str, Any]:
     name = str(item.get("block") or "").strip()
     xy = _as_xy(item.get("xy") or item.get("to"))
     if (not xy) and found:
         xy = list(found["xy"])
     if not name or not xy:
         return {"ok": False, "reason": "缺少块名或坐标", "item": item}
+    # 落笔前先吸附：越界夹回、同类偏移校正、同轴对齐。命中才改，改了就带原因。
+    planned_xy = list(xy)
+    xy, snap_notes = _snap_before_insert(
+        doc, item, block=name, xy=xy, bbox=bbox, region=region, index=index, kind=snap_kind
+    )
+    snapped = bool(snap_notes) and xy != planned_xy
     if not _in_region(xy, bbox):
         return {"ok": False, "reason": "坐标不在当前分区内", "block": name, "xy": xy}
     if name not in doc.blocks and not _import_block(doc, name):
@@ -615,6 +632,10 @@ def _add_insert(doc, msp, item: dict[str, Any], layer: str, bbox, *, found: Opti
         dxfattribs={"layer": layer_name, "rotation": rot, "xscale": sx, "yscale": sy, "zscale": sz},
     )
     out = {"ok": True, "action": "insert", "block": name, "xy": xy, "layer": layer_name, "rot": rot, "handle": ref.dxf.handle}
+    if snapped:
+        out["snapped"] = True
+        out["snap_notes"] = snap_notes
+        out["xy_planned"] = planned_xy
     if found and item.get("rot") is not None:
         try:
             if abs(_normalize_deg(float(item.get("rot"))) - _normalize_deg(rot)) > 0.5:
@@ -622,6 +643,37 @@ def _add_insert(doc, msp, item: dict[str, Any], layer: str, bbox, *, found: Opti
         except Exception:
             pass
     return out
+
+
+def _snap_before_insert(
+    doc,
+    item: dict[str, Any],
+    *,
+    block: str,
+    xy,
+    bbox,
+    region: Optional[dict[str, Any]],
+    index: Optional[dict[str, Any]],
+    kind: str,
+):
+    """跑一轮 placement.snap_xy；任何异常都退回原坐标，不阻断写入。"""
+    if not xy:
+        return xy, []
+    try:
+        from . import placement
+
+        new_xy, notes = placement.snap_xy(
+            doc, item, block=block, xy=xy, bbox=bbox, region=region, index=index, kind=kind
+        )
+    except Exception:
+        log.exception("snap_xy failed, keep planned xy")
+        return xy, []
+    if not notes or not new_xy:
+        return xy, []
+    try:
+        return [float(new_xy[0]), float(new_xy[1])], [str(n) for n in notes if n]
+    except Exception:
+        return xy, []
 
 
 def _hide_or_delete(doc, msp, item: dict[str, Any], bbox, layer: str) -> dict[str, Any]:
@@ -719,21 +771,75 @@ def _apply_overlay_draw_order(doc, msp, results: list[dict[str, Any]]) -> None:
         log.exception("set overlay draw order failed")
 
 
+def placement_issues(
+    doc,
+    plan: dict[str, Any],
+    *,
+    bbox=None,
+    region: Optional[dict[str, Any]] = None,
+    index: Optional[dict[str, Any]] = None,
+) -> list[dict[str, Any]]:
+    """跑一轮坐标校验；出问题只记日志，不影响写入。"""
+    try:
+        from . import placement
+
+        return placement.check_plan(doc, plan, bbox=bbox, region=region, index=index)
+    except Exception:
+        log.exception("check_plan failed")
+        return []
+
+
+def _issue_codes(issues: Optional[list[dict[str, Any]]]) -> dict[tuple[str, int], str]:
+    """(op, index) → 第一个 error 级 issue code，用于给失败项补充原因。"""
+    out: dict[tuple[str, int], str] = {}
+    for item in issues or []:
+        if not isinstance(item, dict) or item.get("severity") != "error":
+            continue
+        try:
+            key = (str(item.get("op") or ""), int(item.get("index")))
+        except (TypeError, ValueError):
+            continue
+        out.setdefault(key, str(item.get("code") or ""))
+    return out
+
+
+def _with_issue_code(result: dict[str, Any], codes: dict[tuple[str, int], str], op: str, idx: int) -> dict[str, Any]:
+    """失败项若对应一条 error 级 issue，把 code 带出去。"""
+    if result.get("ok") or not codes:
+        return result
+    code = codes.get((op, idx))
+    if code and not result.get("issue_code"):
+        result["issue_code"] = code
+    return result
+
+
 def apply_mutations(
     doc,
     plan: dict[str, Any],
     *,
     bbox,
     layer: str,
+    region: Optional[dict[str, Any]] = None,
+    index: Optional[dict[str, Any]] = None,
+    issues: Optional[list[dict[str, Any]]] = None,
 ) -> list[dict[str, Any]]:
     """Mutate an in-memory DXF document. Does not save, snapshot, or write history."""
     msp = doc.modelspace()
     layer = _ensure_layer(doc, layer)
     results: list[dict[str, Any]] = []
+    if issues is None:
+        issues = placement_issues(doc, plan, bbox=bbox, region=region, index=index)
+    codes = _issue_codes(issues)
 
-    for item in plan.get("deletes") or []:
-        results.append(_hide_or_delete(doc, msp, item, bbox, layer))
-    for item in plan.get("replaces") or []:
+    for idx, item in enumerate(plan.get("deletes") or []):
+        result = _hide_or_delete(doc, msp, item, bbox, layer) if isinstance(item, dict) else {
+            "ok": False, "reason": "删除项格式不对", "item": item
+        }
+        results.append(_with_issue_code(result, codes, "delete", idx))
+    for idx, item in enumerate(plan.get("replaces") or []):
+        if not isinstance(item, dict):
+            results.append({"ok": False, "reason": "替换项格式不对", "item": item})
+            continue
         d = _hide_or_delete(
             doc,
             msp,
@@ -744,24 +850,40 @@ def apply_mutations(
             bbox,
             layer,
         )
-        results.append(d)
+        results.append(_with_issue_code(d, codes, "replace", idx))
         if d.get("ok"):
             ins = dict(item)
             ins.setdefault("xy", item.get("to") or item.get("xy") or (d.get("xy")))
-            results.append(_add_insert(doc, msp, ins, layer, bbox, found=d.get("found")))
-    for item in plan.get("moves") or []:
+            results.append(
+                _add_insert(
+                    doc, msp, ins, layer, bbox, found=d.get("found"),
+                    region=region, index=index, snap_kind="replace",
+                )
+            )
+    for idx, item in enumerate(plan.get("moves") or []):
+        if not isinstance(item, dict):
+            results.append({"ok": False, "reason": "移动项格式不对", "item": item})
+            continue
         name = str(item.get("block") or "").strip()
         src = _as_xy(item.get("from") or item.get("from_xy"))
         dst = _as_xy(item.get("to") or item.get("xy"))
         if not name or not src or not dst:
-            results.append({"ok": False, "reason": "移动需要块名、起点和终点", "item": item})
+            results.append(_with_issue_code(
+                {"ok": False, "reason": "移动需要块名、起点和终点", "item": item}, codes, "move", idx
+            ))
             continue
         found = find_symbol(doc, msp, name, src, bbox)
         if not found or found["kind"] != "direct":
-            results.append({"ok": False, "reason": f"没有找到要移动的「{name}」", "block": name, "from": src})
+            results.append(_with_issue_code(
+                {"ok": False, "reason": f"没有找到要移动的「{name}」", "block": name, "from": src},
+                codes, "move", idx,
+            ))
             continue
         if not _in_region(dst, bbox):
-            results.append({"ok": False, "reason": "目标坐标不在当前分区内", "block": name, "to": dst})
+            results.append(_with_issue_code(
+                {"ok": False, "reason": "目标坐标不在当前分区内", "block": name, "to": dst},
+                codes, "move", idx,
+            ))
             continue
         ent = found["entity"]
         try:
@@ -769,19 +891,36 @@ def apply_mutations(
             if item.get("rot") is not None:
                 ent.dxf.rotation = float(item["rot"])
         except Exception as exc:
-            results.append({"ok": False, "reason": f"移动失败：{exc}", "block": name})
+            results.append(_with_issue_code(
+                {"ok": False, "reason": f"移动失败：{exc}", "block": name}, codes, "move", idx
+            ))
             continue
         results.append({"ok": True, "action": "move", "block": name, "from": src, "to": dst})
-    for item in plan.get("inserts") or []:
-        results.append(_add_insert(doc, msp, item, layer, bbox))
-    for item in plan.get("texts") or []:
+    for idx, item in enumerate(plan.get("inserts") or []):
+        if not isinstance(item, dict):
+            results.append({"ok": False, "reason": "新增项格式不对", "item": item})
+            continue
+        results.append(
+            _with_issue_code(
+                _add_insert(doc, msp, item, layer, bbox, region=region, index=index, snap_kind="insert"),
+                codes, "insert", idx,
+            )
+        )
+    for idx, item in enumerate(plan.get("texts") or []):
+        if not isinstance(item, dict):
+            results.append({"ok": False, "reason": "文字项格式不对", "item": item})
+            continue
         xy = _as_xy(item.get("xy"))
         txt = str(item.get("text") or "").strip()
         if not xy or not txt:
-            results.append({"ok": False, "reason": "文字缺少内容或坐标", "item": item})
+            results.append(_with_issue_code(
+                {"ok": False, "reason": "文字缺少内容或坐标", "item": item}, codes, "text", idx
+            ))
             continue
         if not _in_region(xy, bbox):
-            results.append({"ok": False, "reason": "文字坐标不在当前分区内", "xy": xy})
+            results.append(_with_issue_code(
+                {"ok": False, "reason": "文字坐标不在当前分区内", "xy": xy}, codes, "text", idx
+            ))
             continue
         layer_name = _ensure_layer(doc, layer)
         height = float(item.get("height") or 200)
@@ -793,14 +932,21 @@ def apply_mutations(
             results.append({"ok": True, "action": "text", "text": txt, "xy": xy, "layer": layer_name})
         except Exception as exc:
             results.append({"ok": False, "reason": f"写文字失败：{exc}"})
-    for item in plan.get("pipes") or []:
+    for idx, item in enumerate(plan.get("pipes") or []):
+        if not isinstance(item, dict):
+            results.append({"ok": False, "reason": "管线项格式不对", "item": item})
+            continue
         a = _as_xy(item.get("from"))
         b = _as_xy(item.get("to"))
         if not a or not b:
-            results.append({"ok": False, "reason": "管线缺少端点", "item": item})
+            results.append(_with_issue_code(
+                {"ok": False, "reason": "管线缺少端点", "item": item}, codes, "pipe", idx
+            ))
             continue
         if not (_in_region(a, bbox) and _in_region(b, bbox)):
-            results.append({"ok": False, "reason": "管线端点不在当前分区内"})
+            results.append(_with_issue_code(
+                {"ok": False, "reason": "管线端点不在当前分区内"}, codes, "pipe", idx
+            ))
             continue
         layer_name = _ensure_layer(doc, layer)
         width = float(item.get("const_width") or 25)
@@ -813,17 +959,66 @@ def apply_mutations(
     return results
 
 
+def _repair_material_table(doc) -> int:
+    """摘掉材质表里指向已丢失对象的空引用，缺的按需重建。
+
+    DWG 转 DXF 的产物常把 OBJECTS 段的 MATERIAL 丢掉，只留下 ACAD_MATERIAL
+    字典里的 handle。ezdxf 保存时会在 _update_header_vars 里取
+    materials.get("ByLayer").dxf，拿到的是字符串就抛 AttributeError，
+    整次写入全废，用户看到的就是「确认后报 500、图没变」。
+    """
+    fixed = 0
+    try:
+        table = doc.rootdict.get("ACAD_MATERIAL")
+    except Exception:
+        table = None
+    if table is None:
+        return 0
+    for name in ("ByBlock", "ByLayer", "Global"):
+        try:
+            entry = table.get(name)
+        except Exception:
+            entry = None
+        # 正常是 Material 实体；拿到 str 说明引用已经悬空。
+        if entry is not None and not hasattr(entry, "dxf"):
+            try:
+                table.discard(name)
+                fixed += 1
+            except Exception:
+                log.exception("摘除坏材质条目失败：%s", name)
+    for name in ("ByBlock", "ByLayer", "Global"):
+        try:
+            if table.get(name) is None:
+                doc.materials.new(name)
+                fixed += 1
+        except Exception:
+            log.exception("重建材质 %s 失败", name)
+    if fixed:
+        log.info("材质表空引用已修复 %s 处", fixed)
+    return fixed
+
+
 def _read_doc(path: Path, encoding: str = "utf-8"):
     try:
-        return ezdxf.readfile(str(path), encoding=encoding)
+        doc = ezdxf.readfile(str(path), encoding=encoding)
     except Exception:
-        return ezdxf.readfile(str(path))
+        doc = ezdxf.readfile(str(path))
+    _repair_material_table(doc)
+    return doc
 
 
 def _save_doc(doc, dest: Path) -> None:
     tmp = dest.with_suffix(".write.dxf")
     try:
-        doc.saveas(str(tmp))
+        try:
+            doc.saveas(str(tmp))
+        except Exception:
+            # 内存里的文档偶尔又冒出空引用（比如替换块时带进来的）；
+            # 再修一次材质表后重试，修不动就把原错误抛给调用方。
+            if not _repair_material_table(doc):
+                raise
+            log.warning("保存失败，修复材质表后重试一次")
+            doc.saveas(str(tmp))
         tmp.replace(dest)
     except Exception:
         if tmp.is_file():
@@ -859,7 +1054,9 @@ def apply_plan(
     encoding = proj.get("encoding") or "utf-8"
     doc = _read_doc(dest, encoding)
     layer = _ensure_layer(doc, f"{NEW_LAYER_PREFIX}-{next_rev}")
-    results = apply_mutations(doc, plan, bbox=bbox, layer=layer)
+    issues = placement_issues(doc, plan, bbox=bbox, region=region)
+    results = apply_mutations(doc, plan, bbox=bbox, layer=layer, region=region, issues=issues)
+    snapped_count = sum(1 for r in results if r.get("snapped"))
 
     ok_n = sum(1 for r in results if r.get("ok"))
     fail_n = len(results) - ok_n
@@ -927,6 +1124,8 @@ def apply_plan(
         "ok_count": ok_n,
         "failed_count": fail_n,
         "results": _public_results(results),
+        "issues": issues,
+        "snapped_count": snapped_count,
         "dirty": True,
         "can_undo": True,
         "official_untouched": False,
@@ -1128,7 +1327,8 @@ def _preview_doc(proj: dict[str, Any], plan: dict[str, Any], region: dict[str, A
     next_rev = next_revision_number(proj)
     layer = _ensure_layer(doc, f"{NEW_LAYER_PREFIX}-{next_rev}")
     bbox = (region or {}).get("bbox")
-    results = apply_mutations(doc, plan, bbox=bbox, layer=layer)
+    # 预览与正式写入走同一套吸附，所见即所得。
+    results = apply_mutations(doc, plan, bbox=bbox, layer=layer, region=region)
     ok_n = sum(1 for r in results if r.get("ok"))
     if ok_n == 0:
         reasons = [r.get("reason") for r in results if r.get("reason")]
@@ -1147,10 +1347,10 @@ def render_plan_preview(
 ) -> dict[str, Any]:
     """Apply the plan to a temporary in-memory copy and render it. No history, no writes.
 
-    Default: render only the dirty crop (union of edits plus pad) when it is not
-    nearly the full current sheet. The right-hand preview is that region, not a
-    full-sheet composite. Pass incremental=False or crop=False to force a
-    full-sheet render for comparison or tests.
+    Default: 渲染「改动附近的取景窗口」——改动框按 placement.context_bbox 扩到
+    带周边环境（墙体、轴网、同类构件都在），窗口大小以改动约占一半为准。只裁
+    改动框会得到一张看不出原貌的小图；整幅又看不清细节。图上再用 annotate_changes
+    把改动范围圈出来。传 incremental=False 或 crop=False 可强制整幅渲染。
     """
     from . import cad_render
 
@@ -1170,18 +1370,14 @@ def render_plan_preview(
         and not cad_render.nearly_full_dirty(dirty, view)
     ):
         try:
-            base_info = cad_render.base_cache_info(src, view)
-            if base_info:
-                # Crop the cached sheet and redraw only covers / new inserts / nearby
-                # pipes. Output is the dirty region, never a full-sheet PNG.
-                ents = plan_overlay_entities(doc, results)
-                crop_bbox = cad_render.render_dirty_crop_preview(
-                    doc, view, dirty, base_info, dest, stamp=STAMP_PREVIEW, entities=ents,
-                )
-            else:
-                cad_render.render_doc_preview(doc, dirty, dest, stamp=STAMP_PREVIEW)
-                x0, x1, y0, y1 = cad_render.world_limits(dirty)
-                crop_bbox = [x0, y0, x1, y1]
+            # 只裁改动框会得到一张一两百像素的小图，又没有周边墙体轴网可比对。
+            # 先把改动框扩成带环境的窗口，再按窗口重新渲染：既看得清，也知道位置。
+            ctx = placement.context_bbox(dirty, view) or list(dirty)
+            cad_render.render_doc_preview(doc, ctx, dest, stamp=STAMP_PREVIEW)
+            cad_render.annotate_changes(dest, ctx, dirty, results)
+            # world_limits 返回的是 (x0, x1, y0, y1)，别按 bbox 的顺序接。
+            lx0, lx1, ly0, ly1 = cad_render.world_limits(ctx)
+            crop_bbox = [lx0, ly0, lx1, ly1]
             used_crop = True
         except Exception:
             log.exception("crop plan preview failed, falling back to full render")
@@ -1197,6 +1393,7 @@ def render_plan_preview(
         "crop": used_crop,
         "crop_bbox": list(crop_bbox) if used_crop and crop_bbox else None,
         "dirty_bbox": dirty,
+        "focus_bbox": dirty,
         "ok_count": ok_n,
         "failed_count": len(results) - ok_n,
         "results": _public_results(results),

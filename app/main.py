@@ -16,10 +16,11 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import apply, archive_queue, auth, cad_render, config, decision, init_proj, library, maas, projects, scene
+from . import apply, archive_queue, auth, cad_render, config, decision, init_proj, library, maas, placement, projects, scene
 from .prompts import (
     SYSTEM_PROMPT,
     build_history_messages,
+    build_repair_message,
     build_user_message,
     detect_intent,
     is_edit_plan,
@@ -31,6 +32,9 @@ from .prompts import (
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("tutan")
+
+# 方案出图前最多回喂模型修一次坐标。再多就会拖慢对话，也让模型反复改坏。
+MAX_PLAN_REPAIRS = 1
 
 # Never log secrets. Mention only whether they exist.
 log.info(
@@ -347,6 +351,81 @@ async def _offload(fn, *args, **kwargs):
     return await asyncio.to_thread(fn, *args, **kwargs)
 
 
+def _check_plan_coords(proj: dict[str, Any], plan: dict[str, Any], region_info: dict[str, Any]):
+    """在内存工作图上跑坐标校验。只读 DXF，不写盘、不出快照。"""
+    doc = apply._read_doc(Path(apply.current_dxf(proj)), proj.get("encoding") or "utf-8")
+    return placement.check_plan(
+        doc,
+        plan,
+        bbox=(region_info or {}).get("bbox"),
+        region=region_info,
+    )
+
+
+def _error_issues(issues) -> list[dict[str, Any]]:
+    return [i for i in (issues or []) if isinstance(i, dict) and i.get("severity") == "error"]
+
+
+def _xy_changes(old: dict[str, Any], new: dict[str, Any]) -> int:
+    """数一数修复后被挪了坐标的项，用于给用户一句可核对的提示。"""
+    changed = 0
+    pairs = (("inserts", "xy"), ("replaces", "xy"), ("moves", "to"))
+    for key, field in pairs:
+        before = old.get(key) or []
+        after = new.get(key) or []
+        for a, b in zip(before, after):
+            if not isinstance(a, dict) or not isinstance(b, dict):
+                continue
+            pa, pb = a.get(field), b.get(field)
+            if not pa or not pb:
+                continue
+            try:
+                if abs(float(pa[0]) - float(pb[0])) > 1.0 or abs(float(pa[1]) - float(pb[1])) > 1.0:
+                    changed += 1
+            except (TypeError, ValueError, IndexError):
+                continue
+    return changed
+
+
+async def _collect_completion(**kwargs):
+    """收完一次模型输出，但不把 delta 交给前端；等待期间只发心跳。"""
+    chunks: list[str] = []
+
+    async def _drain():
+        async for ev in maas.complete(**kwargs):
+            if ev.get("type") == "delta":
+                chunks.append(ev.get("text") or "")
+            elif ev.get("type") == "end":
+                return
+
+    task = asyncio.create_task(_drain())
+    try:
+        while True:
+            done, _pending = await asyncio.wait({task}, timeout=5.0)
+            if done:
+                break
+            yield {"type": "heartbeat"}
+        task.result()
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
+    yield {"type": "text", "text": "".join(chunks).strip()}
+
+
+def _geometry_hint(corrected: int, issues: list[dict[str, Any]]) -> str:
+    """方案后面追加的一句短提示；没发生校正也没有值得说的项时返回空串。"""
+    if corrected > 0:
+        return f"其中 {corrected} 处坐标按图面几何做过校正，可在右侧预览里核对。"
+    # 块尺寸缺失只是「核不了」，不值得打扰用户。
+    real = [
+        i for i in (issues or [])
+        if isinstance(i, dict) and (i.get("severity") == "error" or i.get("code") != "missing_size")
+    ]
+    if real:
+        return f"有 {len(real)} 处坐标需要留意，可在右侧预览里核对。"
+    return ""
+
+
 @app.post("/api/projects/{project_id}/chat")
 async def api_chat(project_id: str, body: ChatBody, user: str = Depends(_user)):
     proj = await _offload(_proj_or_404, project_id, need_file=True, need_ready=True)
@@ -580,10 +659,68 @@ async def api_chat(project_id: str, body: ChatBody, user: str = Depends(_user)):
             raw_text = "".join(collected).strip()
             plan = maas.extract_assistant_payload(raw_text)
             edit_plan = is_edit_plan(plan)
+            corrected = 0
+            issues: list[dict[str, Any]] = []
+
+            # 方案出完先按图面几何校一遍坐标；有 error 就回喂模型只修坐标，
+            # 中间结果不推给前端，最多修 MAX_PLAN_REPAIRS 轮，出错就用原方案。
+            if edit_plan and plan_has_edits(plan):
+                try:
+                    async for item in _await_with_heartbeats(_check_plan_coords, proj, plan, region_info):
+                        if isinstance(item, (bytes, bytearray)):
+                            yield item
+                        else:
+                            issues = item
+                except Exception:
+                    log.exception("plan coordinate check failed")
+                    issues = []
+                errors = _error_issues(issues)
+                repairs = 0
+                while errors and repairs < MAX_PLAN_REPAIRS:
+                    repairs += 1
+                    yield _sse({"type": "status", "text": "正在按图面校正坐标…"})
+                    try:
+                        repair_payload = f"{user_payload}\n\n{build_repair_message(errors, plan)}"
+                        repaired_raw = ""
+                        async for item in _collect_completion(
+                            model=model,
+                            system=SYSTEM_PROMPT,
+                            user_text=repair_payload,
+                            image_data_url=None,
+                            history=history,
+                        ):
+                            if isinstance(item, dict) and item.get("type") == "text":
+                                repaired_raw = item.get("text") or ""
+                            elif isinstance(item, dict):
+                                yield _sse(item)
+                        candidate = maas.extract_assistant_payload(repaired_raw)
+                        if not (candidate and is_edit_plan(candidate)):
+                            break
+                        candidate_issues = await _offload(_check_plan_coords, proj, candidate, region_info)
+                        if len(_error_issues(candidate_issues)) >= len(errors):
+                            break
+                        corrected = _xy_changes(plan, candidate)
+                        plan = candidate
+                        raw_text = repaired_raw
+                        edit_plan = True
+                        issues = candidate_issues
+                        errors = _error_issues(issues)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        log.exception("plan coordinate repair failed, keep original plan")
+                        break
+            if edit_plan and isinstance(plan, dict):
+                plan["issues"] = issues
+
+            reply = reply_text(plan, raw_text) or "这次没有给出完整回答，请换一种说法再试，或换一个模型。"
+            hint = _geometry_hint(corrected, issues)
+            if hint and edit_plan:
+                reply = f"{reply}{hint}"
             assistant = {
                 "id": assistant_id,
                 "role": "assistant",
-                "text": reply_text(plan, raw_text) or "这次没有给出完整回答，请换一种说法再试，或换一个模型。",
+                "text": reply,
                 "ts": projects.now_iso(),
                 "model": model,
                 "region": region_info["id"],

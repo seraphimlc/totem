@@ -49,6 +49,44 @@ def build_user_message(task: str, excerpt: str, region_label: str) -> str:
     )
 
 
+def build_repair_message(issues: list[dict[str, Any]], plan: Optional[dict[str, Any]]) -> str:
+    """把几何校验的问题回喂给模型：只修坐标和旋转，其它一律不动。
+
+    写得像给同行的技术回执：列编号、原因和原坐标，剩下交给模型按原 schema 重出。
+    """
+    lines = ["系统校验：上一版方案的坐标有几处与图面几何冲突，请修正后重新输出完整方案。"]
+    label = {"insert": "新增", "replace": "替换", "move": "移动", "text": "文字", "pipe": "管线"}
+    for item in issues or []:
+        if not isinstance(item, dict):
+            continue
+        op = str(item.get("op") or "")
+        idx = item.get("index")
+        try:
+            seq = int(idx) + 1
+        except (TypeError, ValueError):
+            seq = "?"
+        bit = f"- {label.get(op, op)}第 {seq} 项"
+        block = str(item.get("block") or "").strip()
+        if block:
+            bit += f"（{block}）"
+        bit += f"：{item.get('message') or item.get('code') or ''}"
+        xy = item.get("xy")
+        if isinstance(xy, (list, tuple)) and len(xy) >= 2:
+            try:
+                bit += f"，原坐标 [{round(float(xy[0]))}, {round(float(xy[1]))}]"
+            except (TypeError, ValueError):
+                pass
+        lines.append(bit)
+    lines.append(
+        "要求：只改坐标和旋转，让符号落在房间净空内、不压墙线、不与已有符号重叠、"
+        "同一方案里不重复落点；块名、数量、图层、房间都不改动，不删减项。"
+        "仍按原来约定的 JSON schema 输出完整方案，reply 保持一两句中文。"
+    )
+    if isinstance(plan, dict) and plan.get("room"):
+        lines.append(f"本次仍是当前分区：{plan.get('room')}。")
+    return "\n".join(lines)
+
+
 def plan_has_edits(plan: Optional[dict[str, Any]]) -> bool:
     if not plan or not isinstance(plan, dict):
         return False

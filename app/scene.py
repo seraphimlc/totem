@@ -30,7 +30,7 @@ from ezdxf.addons.drawing.type_hints import Color
 from ezdxf.math import Matrix44, Vec2, Vec3
 from ezdxf.path import Command
 
-from . import apply, config
+from . import apply, config, placement
 
 log = logging.getLogger("tutan.scene")
 
@@ -848,8 +848,7 @@ def preview_plan_scene(proj: dict[str, Any], plan: dict[str, Any], region: dict[
 
 
 
-FIT_PAD_RATIO = 0.15
-FIT_MIN_EXTENT = 1800.0
+# 取景比例已统一到 placement.context_bbox，这里只留旧名兼容。
 
 
 def insert_world_bbox(rec: dict[str, Any], symbols: Optional[dict[str, Any]] = None) -> Optional[list[float]]:
@@ -938,14 +937,13 @@ def fit_bbox_for_patch(patch: Optional[dict[str, Any]], scene: Optional[dict[str
     y0 = min(b[1] for b in boxes)
     x1 = max(b[2] for b in boxes)
     y1 = max(b[3] for b in boxes)
-    w = max(x1 - x0, 1.0)
-    h = max(y1 - y0, 1.0)
-    pad = max(w, h) * FIT_PAD_RATIO
-    if w < FIT_MIN_EXTENT:
-        pad = max(pad, (FIT_MIN_EXTENT - w) / 2.0)
-    if h < FIT_MIN_EXTENT:
-        pad = max(pad, (FIT_MIN_EXTENT - h) / 2.0)
-    return [x0 - pad, y0 - pad, x1 + pad, y1 + pad]
+    # 视野不能只框住改动本身：那样屏幕上只剩两三个符号，看不出这张图原来长什么样。
+    # 交给 placement.context_bbox 统一规则，和位图预览保持同一取景。
+    view = None
+    raw_view = (scene or {}).get("bbox")
+    if isinstance(raw_view, (list, tuple)) and len(raw_view) == 4:
+        view = [float(v) for v in raw_view]
+    return placement.context_bbox([x0, y0, x1, y1], view)
 
 
 def page_display_from_event(previous: Optional[dict[str, Any]], ev: dict[str, Any]) -> dict[str, Any]:
