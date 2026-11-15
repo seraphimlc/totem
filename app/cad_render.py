@@ -19,8 +19,11 @@ from ezdxf.addons.drawing.config import (
     Configuration,
     HatchPolicy,
 )
-from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
+from ezdxf.addons.drawing.matplotlib import SCATTER_POINT_SIZE, MatplotlibBackend
+from ezdxf.npshapes import to_matplotlib_path
 from matplotlib import font_manager
+from matplotlib.collections import LineCollection
+from matplotlib.patches import PathPatch
 from PIL import Image, ImageDraw, ImageFont
 
 from . import config
@@ -231,6 +234,151 @@ def filter_layout(layout, bbox, margin=8000, doc_key: Optional[str] = None):
     return out
 
 
+class _BatchedBackend(MatplotlibBackend):
+    """把相邻的同类线合并成少量 artist。
+
+    ezdxf 的 mpl 后端每次 draw_solid_lines / draw_path 都新建一个 LineCollection
+    或 PathPatch：一张图几千条线就是几千个 artist，单个预览实测十几秒，而耗时
+    几乎全在 matplotlib 建 artist、更新 datalim 上，跟图形复杂度无关。这里按
+    「颜色 + 线宽」攒起来一次画完；遇到别的图元类型（文字、填充、图片）就先
+    把攒的刷出去，所以绘制先后顺序与原实现一致，遮盖关系不会变。
+
+    只合并描边，不合并填充：填充要 detect_holes，跨实体合并会让相邻或重叠的
+    两个填充互相当成内孔，颜色会串。
+    """
+
+    _MAX_SEGMENTS = 3000
+
+    def __init__(self, ax, **kwargs):
+        super().__init__(ax, **kwargs)
+        self._lines: dict[tuple, list] = {}
+        self._paths: dict[tuple, list] = {}
+        self._points: dict[tuple, list] = {}
+        self._order: list[tuple] = []
+        self._pending = 0
+
+    # -- 攒与刷 ---------------------------------------------------------
+    def _key(self, properties) -> tuple:
+        try:
+            lw = round(float(self.get_lineweight(properties)), 3)
+        except Exception:
+            lw = 1.0
+        return (str(properties.color), lw)
+
+    def _bucket(self, store: dict, key: tuple) -> list:
+        buf = store.get(key)
+        if buf is None:
+            buf = []
+            store[key] = buf
+            if key not in self._order:
+                self._order.append(key)
+        return buf
+
+    def _flush(self) -> None:
+        if not self._order:
+            return
+        for key in self._order:
+            points = self._points.pop(key, None)
+            lines = self._lines.pop(key, None)
+            paths = self._paths.pop(key, None)
+            color, lw = key
+            if points:
+                self.ax.scatter(
+                    [p[0] for p in points],
+                    [p[1] for p in points],
+                    s=SCATTER_POINT_SIZE,
+                    c=color,
+                    zorder=self._get_z(),
+                )
+            if lines:
+                self.ax.add_collection(
+                    LineCollection(
+                        lines,
+                        linewidths=lw,
+                        color=color,
+                        zorder=self._get_z(),
+                        capstyle="butt",
+                    )
+                )
+            for path in paths or []:
+                try:
+                    patch = PathPatch(
+                        to_matplotlib_path([path]),
+                        linewidth=lw,
+                        fill=False,
+                        color=color,
+                        zorder=self._get_z(),
+                    )
+                except ValueError:
+                    continue
+                self.ax.add_patch(patch)
+        self._order = []
+        self._pending = 0
+
+    # -- 描边：攒 -------------------------------------------------------
+    def draw_solid_lines(self, lines, properties):
+        key = self._key(properties)
+        segs = self._bucket(self._lines, key)
+        pts = self._bucket(self._points, key)
+        for s, e in lines:
+            if s.isclose(e):
+                pts.append((s.x, s.y))
+            else:
+                segs.append(((s.x, s.y), (e.x, e.y)))
+            self._pending += 1
+        if self._pending >= self._MAX_SEGMENTS:
+            self._flush()
+
+    def draw_line(self, start, end, properties):
+        self.draw_solid_lines([(start, end)], properties)
+
+    def draw_path(self, path, properties):
+        self._bucket(self._paths, self._key(properties)).append(path)
+        self._pending += 1
+        if self._pending >= self._MAX_SEGMENTS:
+            self._flush()
+
+    def draw_point(self, pos, properties):
+        self._bucket(self._points, self._key(properties)).append((pos.x, pos.y))
+        self._pending += 1
+
+    # -- 其余图元：先刷再画，保持顺序 ------------------------------------
+    def draw_filled_paths(self, paths, properties):
+        self._flush()
+        super().draw_filled_paths(paths, properties)
+
+    def draw_filled_polygon(self, points, properties):
+        self._flush()
+        super().draw_filled_polygon(points, properties)
+
+    def draw_text(self, *args, **kwargs):
+        self._flush()
+        return super().draw_text(*args, **kwargs)
+
+    def draw_image(self, *args, **kwargs):
+        self._flush()
+        return super().draw_image(*args, **kwargs)
+
+    def finalize(self) -> None:
+        self._flush()
+        return super().finalize()
+
+
+def _pin_axes_limits(ax) -> None:
+    """预览的 xlim/ylim 是我们自己钉死的，别让每个 artist 去更新 datalim。
+
+    实测这一步能省掉 matplotlib 在 add_collection / add_patch 里做的
+    _update_collection_limits 与 _update_patch_limits，占单次预览的两成。
+    """
+    try:
+        ax.set_autoscalex_on(False)
+        ax.set_autoscaley_on(False)
+        ax._update_collection_limits = lambda *a, **k: None
+        ax._update_patch_limits = lambda *a, **k: None
+    except Exception:
+        pass
+
+
 class _PaperWipeoutFrontend(Frontend):
     """WIPEOUT must fill with the preview paper color, not the modelspace dark background."""
 
@@ -286,7 +434,40 @@ def _guard_huge_fills(frontend, bbox) -> None:
     pipe.draw_filled_polygon = guarded
 
 
-def make_frontend(doc, ax, hatch=HatchPolicy.SHOW_SOLID):
+# 批量绘制开关：出问题时可以整体关掉回到 ezdxf 原生后端。
+BATCH_LINES = True
+
+# 以下三个都按「输出分辨率」而不是按图面尺寸来定细节，因为预览是给人看
+# 「这张图长什么样」的：一个 40px 的洁具符号，128 段和 32 段在屏幕上没有区别。
+# 图里块内实体带虚线样式，一条 700mm 的线会被拆成 280 段；弧按 128 段展平，
+# 40 个弧乘 10 个实例就是几十万段，全烧在建 matplotlib Path 上。
+PREVIEW_ARC_SEGMENTS = 32
+DASH_MIN_PX = 1.2          # 虚线段短于这个像素数就按实线画
+FLATTEN_MAX_PX = 0.35      # 曲线展平误差不超过这个像素数
+
+
+def _pixel_limits(world_span: float, pixel_span: float) -> tuple[float, float]:
+    """把「多少个像素」换算成图面单位，得到最少虚线段长与最大展平距离。"""
+    try:
+        per_px = abs(float(world_span)) / max(abs(float(pixel_span)), 1.0)
+    except Exception:
+        per_px = 1.0
+    if not per_px or per_px != per_px:  # 0 或 nan
+        per_px = 1.0
+    min_dash = per_px * DASH_MIN_PX
+    flatten = min(max(per_px * FLATTEN_MAX_PX, 0.02), 50.0)
+    return min_dash, flatten
+
+
+def make_frontend(
+    doc,
+    ax,
+    hatch=HatchPolicy.SHOW_SOLID,
+    *,
+    batch: Optional[bool] = None,
+    min_dash: float = 0.05,
+    flatten: float = 0.01,
+):
     ctx = RenderContext(doc)
     cfg = Configuration(
         background_policy=BackgroundPolicy.CUSTOM,
@@ -296,15 +477,20 @@ def make_frontend(doc, ax, hatch=HatchPolicy.SHOW_SOLID):
         min_lineweight=0.12,
         hatching_timeout=1.5,
         hatch_policy=hatch,
+        circle_approximation_count=PREVIEW_ARC_SEGMENTS,
+        max_flattening_distance=flatten,
+        min_dash_length=min_dash,
     )
     # Pin our own figure size and xlim/ylim; ezdxf finalize() would autoscale and resize.
-    backend = MatplotlibBackend(ax, adjust_figure=False)
+    _pin_axes_limits(ax)
+    use_batch = BATCH_LINES if batch is None else bool(batch)
+    backend = (_BatchedBackend if use_batch else MatplotlibBackend)(ax, adjust_figure=False)
     return _PaperWipeoutFrontend(ctx, backend, config=cfg)
 
 
 def render_region(doc, layout, bbox, out_path: Path, *, dpi=130, pad=PAD, margin=4000,
                   hatch=HatchPolicy.SHOW_SOLID, xlim=None, ylim=None, fig_wh=None,
-                  entities=None, transparent: bool = False):
+                  entities=None, transparent: bool = False, batch: Optional[bool] = None):
     """Render a crop of model space. Does not write back to the DXF.
 
     xlim/ylim/fig_wh pin the world-to-pixel transform so a dirty patch can be
@@ -321,6 +507,7 @@ def render_region(doc, layout, bbox, out_path: Path, *, dpi=130, pad=PAD, margin
         else:
             fh, fw = long, max(long * w / h, 1.0)
     bg = "none" if transparent else "white"
+    long_side_px = max(fw, fh) * float(dpi)
     fig = plt.figure(figsize=(fw, fh), dpi=dpi, facecolor=bg)
     ax = fig.add_axes([0, 0, 1, 1])
     ax.set_facecolor(bg)
@@ -337,7 +524,11 @@ def render_region(doc, layout, bbox, out_path: Path, *, dpi=130, pad=PAD, margin
             ents = list(reorder.ascending(ents, mapping))
     except Exception:
         pass
-    fe = make_frontend(doc, ax, hatch=hatch)
+    # 图面单位 / 像素：按这个限制虚线密度与曲线展平误差
+    min_dash, flatten = _pixel_limits(max(w, h), long_side_px)
+    fe = make_frontend(
+        doc, ax, hatch=hatch, batch=batch, min_dash=min_dash, flatten=flatten
+    )
     try:
         fe.ctx.set_current_layout(layout)
     except Exception:
@@ -349,6 +540,12 @@ def render_region(doc, layout, bbox, out_path: Path, *, dpi=130, pad=PAD, margin
     _guard_huge_fills(fe, (xmin, ymin, xmax, ymax))
     try:
         fe.draw_entities(ents)
+    except Exception:
+        pass
+    # 攒下的图元必须在 savefig 之前落地。不走 pipeline.finalize()，它会
+    # autoscale 并改 figure 尺寸，破坏钉死的世界坐标→像素映射。
+    try:
+        fe.pipeline.backend.finalize()
     except Exception:
         pass
     # Do not call pipeline.finalize(): MatplotlibBackend.finalize() autoscales and
