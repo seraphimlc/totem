@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import re
@@ -363,6 +364,8 @@ def public_status(proj: dict[str, Any]) -> dict[str, Any]:
         "resumed": bool(st.get("resumed")),
         "resumable": (not ready) and state in {"error", "interrupted", "running", "pending"},
         "updated_at": st.get("updated_at"),
+        # DWG 转换事实（tool/how/dxfversion/warnings）：有才带，前端只当可选字段读。
+        **({"convert": st["convert"]} if isinstance(st.get("convert"), dict) else {}),
     }
 
 
@@ -535,8 +538,26 @@ def _ensure_dxf(proj: dict[str, Any], st: dict[str, Any]) -> Path:
         return dest
     if src.suffix.lower() == ".dwg":
         report_progress(proj, st, step="save", current=0, total=1, message="正在把 DWG 转成 DXF。", flush=True)
-        convert_dwg(src, dest)
-        return dest
+        facts: dict[str, Any] = {}
+        # 先看签名再决定怎么调，只调一次：真转换里抛出的 TypeError 不能被当成「签名不对」
+        # 而吞掉再跑第二遍。
+        if _accepts_out_param(convert_dwg):
+            converted = convert_dwg(src, dest, out=facts)
+        else:
+            # 旧签名 (src, dest)（测试替身 / 第三方包装）：不带 out，状态里就不写 convert。
+            converted = convert_dwg(src, dest)
+        if facts:
+            st["convert"] = facts
+            tool = {"oda": "ODA", "dwg2dxf": "dwg2dxf"}.get(facts.get("tool"), facts.get("tool") or "")
+            msg = f"DWG 已用 {tool} 转成 DXF" if tool else "DWG 已转成 DXF"
+            if facts.get("dxfversion"):
+                msg += f"（{facts['dxfversion']}）"
+            # 转换消耗的时间也归在「保存」这一步里，进度条照常往下走。
+            report_progress(
+                proj, st, step="save", current=1, total=1, message=msg + "。", flush=True
+            )
+            write_status(proj, st)
+        return Path(converted or dest)
     raise ValueError("只接受 DWG 或 DXF 图纸。")
 
 
@@ -565,11 +586,13 @@ def _which_where(name: str) -> str:
     return dwg2dxf._which_where(name)
 
 
-def convert_dwg(src: Path, dest: Path) -> Path:
+def convert_dwg(src: Path, dest: Path, *, out: Optional[dict[str, Any]] = None) -> Path:
     """把 DWG 转成 DXF。失败抛 ValueError，文案与改动前一致。
 
     工具选择与子进程细节在 app/convert/；这里只负责把结构化错误翻译成
     用户能看到的中文，并保证 ``_ensure_dxf()`` 的调用方式不变。
+    传了 ``out`` 时把转换事实（tool/how/dxfversion/warnings，**不含路径**）填进去，
+    供 init.json 的 ``st["convert"]`` 使用；不传就什么都不改。
     """
     from . import convert
 
@@ -582,7 +605,66 @@ def convert_dwg(src: Path, dest: Path) -> Path:
         raise ValueError(convert.MSG_FAILED % (exc.detail or "没有输出")) from exc
     if result.warnings:
         log.info("DWG conversion warnings: %s", "; ".join(result.warnings))
+    if out is not None:
+        out.update(convert_summary(result))
     return Path(result.output_path or dest)
+
+
+def _accepts_out_param(func: Any) -> bool:
+    """``convert_dwg`` 是否声明了关键字参数 ``out``（签名检查，不调用）。
+
+    只看显式的 ``out``：``**kwargs`` 包装可能把 out 吃了却不填，那种就不传；
+    被 mock.patch 换成的 Mock 先剥出被替换的原函数再看签名。
+    """
+    target = func
+    for _ in range(3):
+        inner = getattr(target, "__wrapped__", None)
+        if inner is None:
+            mock_self = getattr(target, "_mock_self", None)
+            inner = getattr(mock_self, "_mock_wraps", None) if mock_self is not None else None
+        if inner is None:
+            inner = getattr(target, "side_effect", None) if getattr(target, "_mock_name", None) or hasattr(target, "_mock_self") else None
+        if inner is None or inner is target or not callable(inner):
+            break
+        target = inner
+    try:
+        params = inspect.signature(target).parameters
+    except (TypeError, ValueError):
+        return False
+    return "out" in params
+
+
+# 路径形态：Windows 盘符 / UNC、类 Unix 绝对路径。转换器的原始报错（stderr）里常带安装路径。
+# 先吃掉「目录段 + 可选的带空格子目录」（如 C:\Program Files\ODA\），再吃掉文件段，
+# 遇到空格/标点/中文就停——路径后面的「失败」「failed: rc=1」这类人话要留着。
+# 路径字符：不含空白与中英标点；冒号不进来，路径后面的「: rc=1」才能留住。
+_SEG = r"[^\s\u3000:：，。；、（）\"'\[\]<>]+"
+_DIRS = r"(?:(?:" + _SEG + r"|[ ]" + _SEG + r")[/\\])*"
+_NAME = r"(?:[ ]" + _SEG + r")*"
+_PATH_WIN = re.compile(r"(?:[A-Za-z]:[/\\]|\\\\)" + _DIRS + _SEG + _NAME)
+_PATH_POSIX = re.compile(r"(?<![\w.~/\\])(?:~|/(?!/))" + _DIRS + _SEG + _NAME)
+_RESIDUAL = re.compile(r"(<路径>)[/\\]+")
+
+
+def redact_paths(text: Any) -> str:
+    """把文字里的绝对路径抹成「<路径>」，其余人话（含中文原文）原样保留。"""
+    out = _PATH_WIN.sub("<路径>", str(text or ""))
+    out = _PATH_POSIX.sub("<路径>", out)
+    return _RESIDUAL.sub(r"\1", out)
+
+
+def convert_summary(result: Any) -> dict[str, Any]:
+    """转换结果的公开摘要：只留种类/方式/版本/提示，路径一律不进状态文件与接口。
+
+    ``warnings`` 里可能夹着转换器的原始报错（如 ODA stderr），其中的绝对路径先抹成
+    「<路径>」再截断，确保 init.json / public_status 里没有任何路径。
+    """
+    return {
+        "tool": str(getattr(result, "tool", "") or ""),
+        "how": str(getattr(result, "how", "") or ""),
+        "dxfversion": str(getattr(result, "dxfversion", "") or ""),
+        "warnings": [redact_paths(w)[:200] for w in (getattr(result, "warnings", None) or [])],
+    }
 
 
 def _pick_default_sheet(proj: dict[str, Any]) -> None:
@@ -1202,6 +1284,17 @@ def create_session_from_upload(filename: str, data: bytes, name: Optional[str] =
         raise ValueError("文件大于 80MB，请先精简后再上传。")
     if len(data) < 64:
         raise ValueError("这个文件太小，不像一份完整的图纸。")
+    if suffix == ".dwg":
+        # 没有转换器就别建会话、别落盘：直接给出和初始化阶段一模一样的中文提示。
+        from . import convert
+
+        try:
+            has_converter = convert.find_converter().kind != "none"
+        except Exception:
+            log.exception("dwg converter probe failed")
+            has_converter = True
+        if not has_converter:
+            raise ValueError(convert.MSG_NO_TOOL)
     stem = Path(filename).stem.strip() or "未命名图纸"
     display = (name or stem).strip() or stem
     sid = new_session_id()

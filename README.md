@@ -96,6 +96,15 @@ Windows 说明：
 
 两条路都失败、或一个都没装时，上传 DWG 会提示先在 AutoCAD 里另存为 DXF（建议 AC1021）。设 `CAD_DWG_CONVERTER=none` 可以彻底关闭 DWG 转换。转换结果会统一规范成 UTF-8；原始上传文件不会被覆盖。
 
+- **上传前先看有没有转换器**：一个转换器都没有时，`.dwg` 上传会**立刻**返回 400 和上面那句中文，不会建会话目录、不落盘；DXF 上传不受影响。
+- **状态里能看见用了哪个转换器**：转换成功后，会话的 `init.json`（以及 `/api/projects/{id}/init`）多一个可选字段
+  `convert: {"tool": "oda"|"dwg2dxf", "how": "cli"|"odafc"|"explicit"|"discovered", "dxfversion": "AC1032", "warnings": [...]}`，
+  只记种类与版本，**不含任何路径**；前端不依赖它，没有这个字段时照常显示。
+- **公开健康检查**：`GET /api/health`（无需登录，只读）在原有字段外多一个
+  `dwg: {"converter": "oda"|"dwg2dxf"|"none", "how": "explicit"|"discovered"|""}`，只暴露种类和发现方式，
+  不含路径、工具清单或环境变量；结果缓存 30 秒，只看文件是否可执行、不起子进程。
+  运维自查：`curl -s http://127.0.0.1:8780/api/health | python -m json.tool`。
+
 服务器安装说明（Debian / Ubuntu）：
 
 - ODA：从 Open Design Alliance 下载免费版 ODA File Converter 自行安装，然后在 `/opt/cad-studio/.env` 里写 `CAD_ODA_PATH=/opt/.../ODAFileConverter`。它是带界面的程序，无桌面的服务器需要 `apt install xvfb`（`odafc` 会自己起 Xvfb；没有 Xvfb 时要求存在 `DISPLAY`），否则 ODA 这条路会被跳过。

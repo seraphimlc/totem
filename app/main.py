@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import apply, archive_queue, auth, cad_render, config, decision, init_proj, library, maas, placement, projects, scene
+from . import apply, archive_queue, auth, cad_render, config, convert, decision, init_proj, library, maas, placement, projects, scene
 from .prompts import (
     SYSTEM_PROMPT,
     build_history_messages,
@@ -89,6 +89,14 @@ def _user(request: Request) -> str:
     return auth.require_user(request)
 
 
+def _dwg_health() -> dict[str, str]:
+    try:
+        return convert.health_info()
+    except Exception:
+        log.exception("dwg health check failed")
+        return {"converter": "none", "how": ""}
+
+
 @app.get("/api/health")
 def health():
     return {
@@ -98,6 +106,8 @@ def health():
         "auth_configured": config.auth_configured(),
         "maas_configured": config.maas_configured(),
         "decision_configured": config.decision_configured(),
+        # 公开端点：只给 DWG 转换器的种类与发现方式（无路径、无环境变量），30 秒缓存。
+        "dwg": _dwg_health(),
     }
 
 

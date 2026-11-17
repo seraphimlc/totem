@@ -332,6 +332,8 @@ Phase 1 的自有实现：
 
 ### Phase 2：转换可观测性与上传前预检
 
+**状态：已完成（2026-11）。** 改动：`app/convert/__init__.py` 新增 `health_info()` / `invalidate_health_cache()`（30 秒缓存，只返回 `converter`/`how`）；`app/main.py` 的 `health()` 增加 `dwg` 字段；`init_proj.convert_dwg(..., out=)` 用可选出参带出 `ConversionResult`，`_ensure_dxf()` 成功后写 `st["convert"] = {tool, how, dxfversion, warnings}` 并立即 `write_status`，`public_status()` 透出该字段；`create_session_from_upload()` 在 `.dwg` 且 `find_converter().kind == "none"` 时、建目录之前就抛 `ValueError(convert.MSG_NO_TOOL)`。测试集中在 `scripts/test_phase2.py`（TestClient + 临时 `CAD_DATA_DIR`），详见本文末尾「Phase 2 验收」。
+
 - `app/main.py` 的 `health()` 增加 `"dwg": {"converter": "oda" | "dwg2dxf" | "none", "how": "explicit" | "discovered"}`。只暴露工具种类与发现方式。**`/api/health` 是公开端点**（`app/main.py` 的 `require_session_on_api` 中间件放行 `_PUBLIC_API = {"/api/health", "/api/login", "/api/logout"}`），任何未登录的人都能读到，因此**绝不能**把可执行文件路径、版本字符串里的安装目录、或 `converter_status()` 的原始内容放进去。完整路径只进服务端日志，`converter_status()` 返回完整信息仅供日志使用。
 - `init_proj` 在 `_ensure_dxf()` 成功后把 `{"tool", "dxfversion", "warnings"}` 写进 `init.json` 的 `save` 步骤 message，前端「准备」面板可直接显示“DWG 已用 ODA 转成 DXF”。
 - 上传时若转换器种类为 `"none"`（即 `converter_status()` 返回的 `kind` 字段等于 `"none"`，**不是**用 `"none"` 当字典键去取值）且后缀是 `.dwg`，直接返回 400 并给出现有提示，而不是等到后台初始化才失败。
@@ -459,3 +461,12 @@ Phase 1 的自有实现：
 本文件引用到的 cad-ai-agent 路径：
 
 `LICENSE`、`README.md`、`Dockerfile`、`pyproject.toml`、`src/cad_dxf_agent/settings.py`、`src/cad_dxf_agent/core/converter.py`、`src/cad_dxf_agent/core/plan_validator.py`、`src/cad_dxf_agent/core/plan_converter.py`、`src/cad_dxf_agent/core/apply_pipeline.py`、`src/cad_dxf_agent/core/edit_history.py`、`src/cad_dxf_agent/core/preview_builder.py`、`src/cad_dxf_agent/core/compliance_rules.py`、`src/cad_dxf_agent/core/takeoff_engine.py`、`src/cad_dxf_agent/core/session_store.py`、`src/cad_dxf_agent/core/revision_notes.py`、`src/cad_dxf_agent/models/ops_schema.py`、`src/cad_dxf_agent/models/plan_schema.py`、`src/cad_dxf_agent/models/preview_schema.py`、`src/cad_dxf_agent/models/compliance_schema.py`、`src/cad_dxf_agent/models/takeoff_schema.py`、`tests/unit/test_converter.py`。
+
+### Phase 2 验收
+
+`scripts/test_phase2.py`（纯自造，不依赖真实 DWG/ODA）：
+
+- `/api/health` 带 `dwg.converter` / `dwg.how`，原有键都在；payload 里没有 `/`、`\`，也不出现转换器路径与 `converter_status` 才有的字段；同一 30 秒窗口内只查找一次（缓存生效）。
+- 转换成功后 `init.json` 的 `convert` 记录 `tool/how/dxfversion/warnings`，没有路径，公开状态透出；`convert_dwg()` 签名与返回值不变，老文案（`MSG_NO_TOOL` / `MSG_FAILED % …`）不变。
+- 无转换器时 `.dwg` 上传：`ValueError(MSG_NO_TOOL)`、不建 `sessions/` 目录、不写 `sessions.json`；HTTP 走 `/api/projects/upload` 返回 400 与同一句中文。
+- 无转换器时 `.dxf` 上传照常建会话、写 source、启动初始化、`init.json` 不带 `convert`。

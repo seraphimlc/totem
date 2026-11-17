@@ -20,10 +20,11 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from . import dwg2dxf, oda
 from .base import Budget, ConvertError, ConversionResult, Options
@@ -41,6 +42,8 @@ __all__ = [
     "converter_status",
     "find_converter",
     "find_dwg2dxf",
+    "health_info",
+    "invalidate_health_cache",
     "dwg2dxf",
     "oda",
 ]
@@ -90,8 +93,44 @@ def find_converter(opts: Optional[Options] = None) -> ServerConverter:
     return ServerConverter("none", "", "")
 
 
+HEALTH_TTL_SECONDS = 30.0
+_HEALTH_CACHE: dict[str, Any] = {"at": 0.0, "value": None}
+_HEALTH_LOCK = threading.Lock()
+
+
+def invalidate_health_cache() -> None:
+    """清掉 /api/health 的转换器缓存（测试与运维排查用；平时 30 秒自动过期）。"""
+    with _HEALTH_LOCK:
+        _HEALTH_CACHE["at"] = 0.0
+        _HEALTH_CACHE["value"] = None
+
+
+def health_info(opts: Optional[Options] = None) -> dict[str, str]:
+    """公开健康检查用的转换器状态：只有种类与发现方式，**绝不含路径/环境变量**。
+
+    ``/api/health`` 未登录可读，所以这里只吐 {"converter","how"} 两个枚举字段；
+    路径、工具清单、display 之类的排查信息只留在 :func:`converter_status`（日志用）。
+    发现只看文件是否可执行（shutil.which / isfile），不起子进程；结果缓存 30 秒，
+    免得高频轮询时反复扫描。
+    """
+    if opts is not None:
+        conv = find_converter(opts)
+        return {"converter": conv.kind, "how": conv.how if conv.kind != "none" else ""}
+    now = time.monotonic()
+    with _HEALTH_LOCK:
+        cached = _HEALTH_CACHE["value"]
+        if cached is not None and (now - float(_HEALTH_CACHE["at"])) < HEALTH_TTL_SECONDS:
+            return dict(cached)
+    conv = find_converter()
+    value = {"converter": conv.kind, "how": conv.how if conv.kind != "none" else ""}
+    with _HEALTH_LOCK:
+        _HEALTH_CACHE["at"] = now
+        _HEALTH_CACHE["value"] = dict(value)
+    return value
+
+
 def converter_status(opts: Optional[Options] = None) -> dict:
-    """给日志与（Phase 2 的）健康检查用。含路径，**不要**直接回给未登录的 HTTP。"""
+    """给日志与运维排查用。含路径，**不要**直接回给未登录的 HTTP（健康检查用 health_info）。"""
     opts = opts or Options.from_env()
     conv = find_converter(opts)
     return {
