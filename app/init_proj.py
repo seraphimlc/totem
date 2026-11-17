@@ -933,41 +933,6 @@ def build_first_index(
     return index
 
 
-def _collect_texts(msp, on_progress: Optional[Callable[[int, int], None]] = None) -> list[dict[str, Any]]:
-    out = []
-    try:
-        total = len(msp)
-    except Exception:
-        total = 0
-    for i, e in enumerate(msp, start=1):
-        if on_progress and total and (i == 1 or i == total or i % max(total // 20, 1) == 0):
-            on_progress(i, total)
-        typ = e.dxftype()
-        if typ not in {"TEXT", "MTEXT", "ATTRIB", "ATTDEF"}:
-            continue
-        try:
-            if typ == "MTEXT":
-                raw = e.text or e.plain_text()
-            else:
-                raw = e.dxf.text
-            text = re.sub(r"\{\\.*?\}", "", str(raw or ""))
-            text = re.sub(r"[\\][A-Za-z].*?;", "", text)
-            text = re.sub(r"[{}]", "", text).strip()
-            if typ == "MTEXT":
-                text = text.replace("\\P", " ").replace("\\p", " ")
-            text = re.sub(r"\s+", " ", text).strip()
-            if not text:
-                continue
-            loc = e.dxf.insert if typ != "MTEXT" else e.dxf.insert
-            xy = [round(float(loc.x), 3), round(float(loc.y), 3)]
-            layer = getattr(e.dxf, "layer", "") or ""
-            height = float(getattr(e.dxf, "height", 0) or getattr(e.dxf, "char_height", 0) or 0)
-            out.append({"text": text, "xy": xy, "layer": layer, "height": height})
-        except Exception:
-            continue
-    return out
-
-
 def _detect_sheets(doc, msp, inserts: list[dict[str, Any]], texts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     frames: list[dict[str, Any]] = []
     for ins in inserts:

@@ -968,7 +968,7 @@
 
   function planHasEdits(plan) {
     if (!plan) return false;
-    return ["inserts", "pipes", "texts", "deletes", "replaces", "moves"].some(
+    return ["inserts", "pipes", "texts", "text_edits", "deletes", "replaces", "moves"].some(
       (k) => Array.isArray(plan[k]) && plan[k].length
     );
   }
@@ -995,6 +995,11 @@
     }
     for (const t of plan.texts || []) {
       items.push(`<li class="text">注记 ${escapeHtml(t.text || "")}  @ ${fmtPt(t.xy)}</li>`);
+    }
+    for (const e of plan.text_edits || []) {
+      items.push(
+        `<li class="text">改文字 ${escapeHtml(e.from_text || "")} → ${escapeHtml(e.text || "")}  @ ${fmtPt(e.xy)}</li>`
+      );
     }
     if (!items.length) return "";
     return `<ul class="plan-bits">${items.join("")}</ul>`;

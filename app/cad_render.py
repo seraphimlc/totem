@@ -908,7 +908,15 @@ def _font(size: int, bold: bool = False):
 
 
 def _plan_has_marks(plan: dict[str, Any]) -> bool:
-    return bool(plan.get("inserts") or plan.get("pipes") or plan.get("texts") or plan.get("deletes") or plan.get("replaces") or plan.get("moves"))
+    return bool(
+        plan.get("inserts")
+        or plan.get("pipes")
+        or plan.get("texts")
+        or plan.get("text_edits")
+        or plan.get("deletes")
+        or plan.get("replaces")
+        or plan.get("moves")
+    )
 
 
 def overlay_preview(base_path: Path, bbox: list[float], plan: dict[str, Any], dest: Path) -> Path:
@@ -1014,6 +1022,17 @@ def overlay_preview(base_path: Path, bbox: list[float], plan: dict[str, Any], de
             continue
         draw.rectangle((tx - 3, ty - 3, tx + 3, ty + 3), fill=redline)
         draw.text((tx + 6, ty - 8), label, font=font, fill=redline)
+
+    for edit in plan.get("text_edits") or []:
+        try:
+            tx, ty = xy(edit["xy"])
+        except Exception:
+            continue
+        new = str(edit.get("text") or "")
+        if not new:
+            continue
+        draw.rectangle((tx - 3, ty - 3, tx + 3, ty + 3), fill=rust)
+        draw.text((tx + 6, ty - 8), f"{edit.get('from_text') or ''} → {new}", font=font, fill=rust)
 
     # stamp — only a small board ticket, not a marketing badge
     if _plan_has_marks(plan):

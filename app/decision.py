@@ -20,6 +20,7 @@ EMPTY_EDITS: dict[str, Any] = {
     "moves": [],
     "pipes": [],
     "texts": [],
+    "text_edits": [],
     "do_not_touch": [],
 }
 

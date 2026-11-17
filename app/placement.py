@@ -688,6 +688,26 @@ def check_plan(doc, plan, *, bbox=None, region=None, index=None) -> list[dict[st
         if not isinstance(item, dict):
             continue
         _check_point_only("text", idx, _xy(item.get("xy")), label="文字")
+    for idx, item in enumerate(plan.get("text_edits") or []):
+        if not isinstance(item, dict):
+            continue
+        point = _xy(item.get("xy"))
+        if point is None:
+            # 与 apply._edit_text 一致：坐标必填（error），否则模型不会补。
+            issues.append(
+                _issue("missing_xy", _SEVERITY_ERROR, "改文字缺少坐标（xy）", "text_edit", idx, "", None)
+            )
+        if not str(item.get("from_text") or "").strip():
+            issues.append(
+                _issue("missing_text", _SEVERITY_ERROR, "改文字缺少原文字（from_text）", "text_edit", idx, "", point)
+            )
+        if not str(item.get("text") or "").strip():
+            issues.append(
+                _issue("missing_text", _SEVERITY_ERROR, "改文字缺少新文字（text）", "text_edit", idx, "", point)
+            )
+        # 有坐标时才查分区/房间范围；缺坐标已按 error 报过。
+        if point:
+            _check_point_only("text_edit", idx, point, label="改文字")
     for idx, item in enumerate(plan.get("pipes") or []):
         if not isinstance(item, dict):
             continue

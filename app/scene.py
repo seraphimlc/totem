@@ -418,27 +418,33 @@ def _text_anchor(ent) -> str:
     return "start"
 
 
+def _entity_anchor(ent) -> Any:  # noqa: ANN401 - ezdxf Vec3
+    """对齐文字（正中对齐等）的定位点在 align_point，insert 是 (0,0)。"""
+    from . import dxftext
+
+    point = dxftext.primary_anchor(ent)
+    if point:
+        return Vec3(point[0], point[1], 0)
+    return ent.dxf.insert
+
+
 def _text_payload(ent, *, matrix: Optional[Matrix44] = None) -> Optional[dict[str, Any]]:
+    from . import dxftext
+
     kind = ent.dxftype()
     try:
         if kind == "MTEXT":
-            raw = ent.plain_text() if hasattr(ent, "plain_text") else ent.text
             height = float(ent.dxf.char_height or 175)
             pos = ent.dxf.insert
             rot = float(getattr(ent.dxf, "rotation", 0) or 0)
         else:
-            raw = ent.dxf.text if ent.dxf.hasattr("text") else ""
-            if hasattr(ent, "plain_text"):
-                try:
-                    raw = ent.plain_text()
-                except Exception:
-                    pass
             height = float(ent.dxf.height or 175)
-            pos = ent.dxf.insert
+            pos = _entity_anchor(ent)
             rot = float(getattr(ent.dxf, "rotation", 0) or 0)
     except Exception:
         return None
-    text = str(raw or "").replace("\r", "").strip()
+    # 与索引、改文字共用同一套清洗：标点逐字保留，%%c 等解码。
+    text = dxftext.clean_entity_text(ent)
     if not text:
         return None
     x, y = float(pos.x), float(pos.y)
@@ -698,11 +704,78 @@ def _cover_item(result: dict[str, Any]) -> Optional[dict[str, Any]]:
     return item
 
 
+def _text_boxes(ent, matrix: Optional[Matrix44] = None, old_text: Optional[str] = None, edit: Optional[dict[str, Any]] = None):
+    """改文字用的粗框：(旧字框, 新字框)，都以文字锚点为起点，按字高和字数估。
+
+    旧字框优先用「改之前的可见字」(结果是 ``from``，以及保留换行的 ``requested``)：
+    底图缓存里画的就是这句，长句（超过十几个字）也要整句盖住，否则旧字尾巴会露在
+    新字旁边；没有就给个下界。旧字框只盖旧字，不与新字框合并（否则会盖掉新字）。
+    """
+    from . import dxftext
+
+    try:
+        height = float(getattr(ent.dxf, "height", 0) or getattr(ent.dxf, "char_height", 0) or 2.5)
+    except Exception:
+        height = 2.5
+    try:
+        rotation = math.radians(float(getattr(ent.dxf, "rotation", 0) or 0))
+    except Exception:
+        rotation = 0.0
+    if matrix is not None:
+        try:
+            axis = matrix.transform_direction(Vec3(1, 0, 0))
+            rotation += math.atan2(axis.y, axis.x)
+            height *= math.hypot(axis.x, axis.y) or 1.0
+        except Exception:
+            pass
+    pts = dxftext.text_points(ent)
+    origin = dxftext.primary_anchor(ent) or (pts[0] if pts else None)
+    if not origin:
+        return None
+
+    def _box(text: str) -> list[float]:
+        lines = max(1, str(text or "").count("\n") + 1)
+        longest = max((len(line) for line in str(text or "").split("\n")), default=1)
+        width = max(height * 0.7 * max(longest, 1), height)
+        depth = height * lines
+        cos_r, sin_r = math.cos(rotation), math.sin(rotation)
+        xs, ys = [], []
+        for lx, ly in ((0.0, -height * 0.3), (width, -height * 0.3), (width, depth), (0.0, depth)):
+            xs.append(origin[0] + lx * cos_r - ly * sin_r)
+            ys.append(origin[1] + lx * sin_r + ly * cos_r)
+        return [min(xs), min(ys), max(xs), max(ys)]
+
+    def _union(a: list[float], b: list[float]) -> list[float]:
+        return [min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])]
+
+    new_box = _box(dxftext.clean_entity_text(ent))
+    old_box = _box((old_text if old_text is not None and str(old_text).strip() else "x" * 12))
+    if edit:
+        # 结果里的 from 把多行压成一行了；旧字原来有几段就按几段算（requested 保留了换行）。
+        requested = edit.get("requested")
+        if requested and str(requested).strip():
+            old_box = _union(old_box, _box(str(requested)))
+    return old_box, new_box
+
+
+def _paper_cover(box: list[float], pad: float = 2.0) -> dict[str, Any]:
+    x0, y0, x1, y1 = (float(v) for v in box)
+    x0, y0, x1, y1 = x0 - pad, y0 - pad, x1 + pad, y1 + pad
+    return {
+        "t": "cover",
+        "p": [_r(x0), _r(y0), _r(x1), _r(y0), _r(x1), _r(y1), _r(x0), _r(y1), _r(x0), _r(y0)],
+        "fill": 1,
+        "c": PAPER,
+        "transient": 1,
+    }
+
+
 def build_scene_patch(doc, results: list[dict[str, Any]], bbox) -> dict[str, Any]:
     """Incremental update: covers, new inserts, hides, and restriped neighbors."""
     hide = []
     covers = []
     insert_recs = []
+    edit_items: list[dict[str, Any]] = []
     symbols: dict[str, dict[str, Any]] = {}
     for res in results or []:
         if not res.get("ok"):
@@ -747,6 +820,34 @@ def build_scene_patch(doc, results: list[dict[str, Any]], bbox) -> dict[str, Any
                         symbols[key] = sym
                 if key in symbols:
                     insert_recs.append(rec)
+        elif action == "text_edit":
+            # 原地改文字：漫游底图是缓存的老图，旧字在那里；这里按 handle 让页面重画这一处，
+            # 再叠上新字，并对旧字会露出来的地方遮一小片纸（临时层，不碰正式底图）。
+            hid = res.get("handle")
+            ent = None
+            if hid:
+                try:
+                    ent = doc.entitydb.get(hid)
+                except Exception:
+                    ent = None
+            if ent is not None and ent.dxftype() in TEXT_TYPES:
+                matrix = None
+                host = res.get("host_handle")
+                if host:
+                    try:
+                        host_ent = doc.entitydb.get(host)
+                        matrix = host_ent.matrix44() if host_ent is not None else None
+                    except Exception:
+                        matrix = None
+                old_box = _text_boxes(ent, matrix, res.get("from"), res)
+                item = _text_payload(ent, matrix=matrix)
+                if item:
+                    item["c"] = INK
+                    edit_items.append(item)
+                    if old_box:
+                        lb, _nb = old_box
+                        edit_items.insert(0, _paper_cover(lb))
+                    hide.append(str(hid))
         elif action == "move":
             # Old location is already mutated; restripe the new insert via handle if present.
             hid = res.get("handle")
@@ -759,7 +860,7 @@ def build_scene_patch(doc, results: list[dict[str, Any]], bbox) -> dict[str, Any
                 if rec:
                     insert_recs.append(rec)
 
-    overlay_items: list[dict[str, Any]] = []
+    overlay_items: list[dict[str, Any]] = list(edit_items)
     try:
         overlay_ents = apply.plan_overlay_entities(doc, results)
     except Exception:
@@ -810,6 +911,7 @@ def build_scene_patch(doc, results: list[dict[str, Any]], bbox) -> dict[str, Any
             "insert": sum(1 for r in results if r.get("ok") and r.get("action") == "insert"),
             "delete": sum(1 for r in results if r.get("ok") and r.get("action") == "delete"),
             "move": sum(1 for r in results if r.get("ok") and r.get("action") == "move"),
+            "text_edit": sum(1 for r in results if r.get("ok") and r.get("action") == "text_edit"),
         },
     }
 

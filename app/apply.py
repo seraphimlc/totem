@@ -645,6 +645,71 @@ def _add_insert(
     return out
 
 
+
+def _attrib_values(insert) -> dict[str, str]:
+    vals: dict[str, str] = {}
+    try:
+        for att in insert.attribs:
+            tag = str(att.dxf.tag or "").strip()
+            if tag:
+                vals[tag] = str(att.dxf.text or "")
+    except Exception:
+        return {}
+    return vals
+
+
+def _attributes_to_carry(doc, msp, item: dict[str, Any], bbox) -> dict[str, str]:
+    """替换前先抄下旧块上要带过去的属性值（设备编号之类）。只认顶层 INSERT。"""
+    if item.get("auto_attribs") is False:
+        return {}
+    try:
+        old_block = str(item.get("from_block") or item.get("block") or "").strip()
+        new_block = str(item.get("block") or "").strip()
+        point = _as_xy(item.get("from_xy") or item.get("xy") or item.get("from"))
+        if not old_block or not new_block or old_block == new_block or not point:
+            return {}
+        found = _find_insert(msp, old_block, point, bbox)
+        if not found:
+            return {}
+        return _attrib_values(found[1])
+    except Exception:
+        log.exception("read replace attribs failed")
+        return {}
+
+
+def _apply_carried_attribs(doc, new_ref, values: dict[str, str], old_layer: str = "") -> dict[str, str]:
+    """把同 tag 的属性值写到新块上；新块没有的 ATTDEF、新块已有的值都不动。"""
+    if new_ref is None or not values:
+        return {}
+    try:
+        block = doc.blocks.get(new_ref.dxf.name)
+        if block is None:
+            return {}
+        out: dict[str, str] = {}
+        existing = _attrib_values(new_ref)
+        for attdef in block.query("ATTDEF"):
+            tag = str(attdef.dxf.tag or "").strip()
+            if not tag or tag not in values or existing.get(tag):
+                continue
+            attribs: dict[str, Any] = {
+                "height": float(getattr(attdef.dxf, "height", 2.5) or 2.5),
+                "flags": int(getattr(attdef.dxf, "flags", 0) or 0),
+            }
+            if old_layer:
+                attribs["layer"] = old_layer
+            new_ref.add_attrib(
+                tag,
+                values[tag],
+                insert=(float(attdef.dxf.insert.x), float(attdef.dxf.insert.y)),
+                dxfattribs=attribs,
+            )
+            out[tag] = values[tag]
+        return out
+    except Exception:
+        log.exception("carry attribs failed")
+        return {}
+
+
 def _snap_before_insert(
     doc,
     item: dict[str, Any],
@@ -840,6 +905,8 @@ def apply_mutations(
         if not isinstance(item, dict):
             results.append({"ok": False, "reason": "替换项格式不对", "item": item})
             continue
+        # 旧块上的属性值要在删除之前抄下来：msp.delete_entity 会把实体销毁。
+        carry = _attributes_to_carry(doc, msp, item, bbox)
         d = _hide_or_delete(
             doc,
             msp,
@@ -854,12 +921,17 @@ def apply_mutations(
         if d.get("ok"):
             ins = dict(item)
             ins.setdefault("xy", item.get("to") or item.get("xy") or (d.get("xy")))
-            results.append(
-                _add_insert(
-                    doc, msp, ins, layer, bbox, found=d.get("found"),
-                    region=region, index=index, snap_kind="replace",
-                )
+            created = _add_insert(
+                doc, msp, ins, layer, bbox, found=d.get("found"),
+                region=region, index=index, snap_kind="replace",
             )
+            if created.get("ok") and carry:
+                ref = created.get("handle") and doc.entitydb.get(created["handle"])
+                old_layer = _layer_name((d.get("found") or {}).get("entity"))
+                applied = _apply_carried_attribs(doc, ref, carry, old_layer)
+                if applied:
+                    created["attribs"] = applied
+            results.append(created)
     for idx, item in enumerate(plan.get("moves") or []):
         if not isinstance(item, dict):
             results.append({"ok": False, "reason": "移动项格式不对", "item": item})
@@ -932,6 +1004,11 @@ def apply_mutations(
             results.append({"ok": True, "action": "text", "text": txt, "xy": xy, "layer": layer_name})
         except Exception as exc:
             results.append({"ok": False, "reason": f"写文字失败：{exc}"})
+    for idx, item in enumerate(plan.get("text_edits") or []):
+        if not isinstance(item, dict):
+            results.append({"ok": False, "reason": "改文字项格式不对", "item": item})
+            continue
+        results.append(_with_issue_code(_edit_text(doc, msp, item, bbox, layer), codes, "text_edit", idx))
     for idx, item in enumerate(plan.get("pipes") or []):
         if not isinstance(item, dict):
             results.append({"ok": False, "reason": "管线项格式不对", "item": item})
@@ -957,6 +1034,231 @@ def apply_mutations(
             results.append({"ok": False, "reason": f"画管线失败：{exc}"})
     _apply_overlay_draw_order(doc, msp, results)
     return results
+
+
+# ---------------------------------------------------------------- 改已有文字
+
+TEXT_EDIT_RADIUS_MM = 1500.0     # 给了坐标时先在这一圈里找
+TEXT_EDIT_TEXT_TYPES = {"TEXT", "MTEXT"}
+
+
+def _text_edit_pool(msp) -> list[tuple[Any, Any]]:
+    """可改的文字：(实体, 写回目标的宿主)。模型空间的 TEXT/MTEXT 宿主是自己；
+    简单顶层 INSERT 上的 ATTRIB 宿主是这条 INSERT。"""
+    pool: list[tuple[Any, Any]] = []
+    for ent in msp:
+        try:
+            kind = ent.dxftype()
+        except Exception:
+            continue
+        if kind in TEXT_EDIT_TEXT_TYPES:
+            pool.append((ent, None))
+            continue
+        if kind != "INSERT":
+            continue
+        try:
+            matrix = ent.matrix44()
+            attribs = list(ent.attribs)
+        except Exception:
+            continue
+        if not attribs:
+            continue
+        for attrib in attribs:
+            pool.append((attrib, (ent, matrix)))
+    return pool
+
+
+OUT_OF_SCOPE_REASON = "当前分区里没有找到原文字「{text}」（别处图幅上的同名文字不改）"
+
+
+def _find_text_to_edit(msp, from_text: str, xy, bbox=None) -> dict[str, Any]:
+    """在当前分区里按可见文字精确匹配（只规整空白），标点算数；失败再按全/半角放宽一次。
+
+    - 范围：命中点必须落在 bbox（当前分区，``_in_region`` 同样的外扩）内；bbox 为空
+      表示整张图。只有别的分区里有匹配 → 明确说「当前分区里没有找到」。
+    - 精确匹配：多处取离 xy 最近的一处；一样近就是歧义，绝不猜。
+    - 放宽（忽略全/半角与空白）：只在**恰好一处**时采用，标 width-normalized；
+      两处以上一律报歧义，不按距离挑。
+    - 子串、去标点、近似字一律不算。
+    """
+    from . import dxftext
+
+    want = dxftext.normalize_whitespace(from_text)
+    pool = _text_edit_pool(msp)
+    cleaned = [(ent, host, dxftext.clean_entity_text(ent)) for ent, host in pool]
+    outside = {
+        "ok": False,
+        "reason": OUT_OF_SCOPE_REASON.format(text=from_text),
+        "from_text": from_text,
+        "xy": xy,
+    }
+    missing = {"ok": False, "reason": f"没有找到原文字「{from_text}」", "from_text": from_text, "xy": xy}
+    ambiguous = {
+        "ok": False,
+        "reason": f"原文字有多处，请给出更准确的位置（「{from_text}」）",
+        "from_text": from_text,
+        "xy": xy,
+    }
+
+    def _scan(key):
+        inside: list[tuple] = []
+        outside_hits = 0
+        for ent, host, visible in cleaned:
+            if not visible or key(visible) != key(want):
+                continue
+            loc = _text_edit_distance(ent, host, xy)
+            if loc is None:
+                continue
+            dist, point = loc
+            if bbox is not None and not _in_region(point, bbox):
+                outside_hits += 1
+                continue
+            inside.append((dist, ent, host, visible, point))
+        return inside, outside_hits
+
+    def _dedupe(hits):
+        seen = set()
+        out = []
+        for h in hits:
+            hid = _handle_of(h[1])
+            if hid in seen:
+                continue
+            seen.add(hid)
+            out.append(h)
+        return out
+
+    exact, exact_outside = _scan(lambda v: v)
+    if exact:
+        found = _resolve(_dedupe(exact), ambiguous)
+        if found.get("ok"):
+            found["match"] = "exact"
+        return found
+    wide, wide_outside = _scan(dxftext.width_fold)
+    if wide:
+        unique = _dedupe(wide)
+        if len(unique) > 1:
+            return ambiguous
+        dist, ent, host, visible, point = unique[0]
+        return {
+            "ok": True,
+            "entity": ent,
+            "host": host,
+            "from": visible,
+            "hit_xy": point,
+            "dist": dist,
+            "match": "width-normalized",
+        }
+    if exact_outside or wide_outside:
+        return outside
+    return missing
+
+
+def _resolve(hits: list[tuple], ambiguous: dict[str, Any]) -> dict[str, Any]:
+    """精确匹配的多处候选：取最近的；一样近（<1mm）就是歧义。"""
+    hits = sorted(hits, key=lambda h: h[0])
+    if len(hits) >= 2 and abs(hits[1][0] - hits[0][0]) < 1.0:
+        return ambiguous
+    dist, ent, host, visible, point = hits[0]
+    return {"ok": True, "entity": ent, "host": host, "from": visible, "hit_xy": point, "dist": dist}
+
+
+def _text_edit_distance(ent, host, xy):
+    """文字到 xy 的距离与最近点；指向文字框内按 0 算。"""
+    from . import dxftext
+
+    matrix = host[1] if host else None
+    points = dxftext.text_points(ent)
+    if not points:
+        return None
+    if matrix is not None:
+        world = []
+        for x, y in points:
+            p = matrix.transform(Vec3(x, y, 0))
+            world.append((float(p.x), float(p.y)))
+        points = world
+    if xy is None:
+        return 0.0, [float(points[0][0]), float(points[0][1])]
+    dist = min(math.hypot(px - xy[0], py - xy[1]) for px, py in points)
+    nearest = min(points, key=lambda p: math.hypot(p[0] - xy[0], p[1] - xy[1]))
+    if host is None:
+        extent = dxftext.text_extent(ent)
+        if extent:
+            pad = 0.5 * max(extent[2] - extent[0], extent[3] - extent[1], 1.0)
+            if extent[0] - pad <= xy[0] <= extent[2] + pad and extent[1] - pad <= xy[1] <= extent[3] + pad:
+                dist = 0.0
+    return dist, [float(nearest[0]), float(nearest[1])]
+
+
+def _set_text_value(ent, new_text: str) -> None:
+    """原地改写可见文字；样式、字高、图层、旋转、宽度因子、对齐点、颜色一律不碰。
+
+    写之前先用同一套口径（``dxftext.edit_visible``）复核：可见字不一致就不落笔。
+    """
+    from . import dxftext
+
+    if ent.dxftype() == "MTEXT":
+        new_raw = dxftext.rewrite_mtext_body(str(ent.text or ""), new_text)
+        dxftext.edit_visible_matches(new_raw, new_text)
+        ent.text = new_raw
+        return
+    new_raw = dxftext.encode_text_control(new_text)
+    dxftext.edit_visible_matches(new_raw, new_text, kind="txt")
+    ent.dxf.text = new_raw
+
+
+def _edit_text(doc, msp, item: dict[str, Any], bbox, layer: str) -> dict[str, Any]:
+    from . import dxftext
+
+    from_text = str(item.get("from_text") or "")
+    new_text = str(item.get("text") if item.get("text") is not None else "")
+    xy = _as_xy(item.get("xy"))
+    if not from_text.strip():
+        return {"ok": False, "reason": "改文字缺少原文字（from_text）", "item": item}
+    if not new_text.strip():
+        return {"ok": False, "reason": "改文字缺少新文字（text）", "item": item}
+    if not xy:
+        return {"ok": False, "reason": "改文字缺少坐标（xy）", "item": item}
+    found = _find_text_to_edit(msp, from_text, xy, bbox)
+    if not found.get("ok"):
+        return found
+    ent = found["entity"]
+    host = found["host"]
+    if not _in_region(xy, bbox):
+        return {"ok": False, "reason": "改文字的坐标不在当前分区内", "from_text": from_text, "xy": xy}
+    handle = _handle_of(ent)
+    layer_before = _layer_name(ent)
+    try:
+        _set_text_value(ent, new_text)
+    except Exception as exc:
+        log.exception("text edit failed")
+        return {"ok": False, "reason": f"改文字失败：{exc}", "from_text": from_text, "handle": handle}
+    # 回读：与 _set_text_value 同样比「落笔的原始串」，用同一套空白口径
+    # （dxftext.edit_visible），标点逐字比。MTEXT 检查时逐行去行尾空白，与 check_visible
+    # 一致；不用 clean_entity_text 的整段折叠，免得把 "a \\n b" 误当成 "a b"。
+    kind = "mtext" if ent.dxftype() == "MTEXT" else "txt"
+    try:
+        visible = dxftext.edit_visible_matches(dxftext.entity_raw(ent), new_text, kind=kind)
+    except ValueError as exc:
+        return {"ok": False, "reason": f"改文字后回读不一致：{exc}", "from_text": from_text, "handle": handle}
+    visible = " ".join(visible.split("\n"))
+    result: dict[str, Any] = {
+        "ok": True,
+        "action": "text_edit",
+        "from": found["from"],
+        "text": visible,
+        "requested": new_text,
+        "xy": found["hit_xy"] or xy,
+        "handle": handle,
+        "layer": layer_before,
+        "kind": ent.dxftype(),
+    }
+    if found.get("match") == "width-normalized":
+        result["match"] = "width-normalized"
+    else:
+        result["match"] = "exact"
+    if host is not None:
+        result["host_handle"] = _handle_of(host[0])
+    return result
 
 
 def _repair_material_table(doc) -> int:
@@ -1199,8 +1501,11 @@ def tight_mutation_boxes(
             boxes.append(bb)
         for key in ("xy", "to", "from", "from_xy"):
             xy = res.get(key)
-            if xy and len(xy) >= 2:
-                x, y = float(xy[0]), float(xy[1])
+            if isinstance(xy, (list, tuple)) and len(xy) >= 2:
+                try:
+                    x, y = float(xy[0]), float(xy[1])
+                except (TypeError, ValueError):
+                    continue
                 boxes.append([x - point_extent, y - point_extent, x + point_extent, y + point_extent])
     return boxes
 
@@ -1287,9 +1592,13 @@ def dirty_bbox_from_results(
         ys.extend([float(bb[1]), float(bb[3])])
 
     def _add_xy(xy, extent=point_extent):
-        if not xy or len(xy) < 2:
+        # 改文字的结果里 from 是原文字（字符串），不是坐标。
+        if not isinstance(xy, (list, tuple)) or len(xy) < 2:
             return
-        x, y = float(xy[0]), float(xy[1])
+        try:
+            x, y = float(xy[0]), float(xy[1])
+        except (TypeError, ValueError):
+            return
         xs.extend([x - extent, x + extent])
         ys.extend([y - extent, y + extent])
 
@@ -1506,6 +1815,7 @@ def excerpt_working(proj: dict[str, Any], *, max_chars: int = 600) -> str:
         covers = sum(1 for r in (entry.get("results") or []) if r.get("action") == "cover")
         inserts = sum(1 for r in (entry.get("results") or []) if r.get("action") == "insert")
         deletes = sum(1 for r in (entry.get("results") or []) if r.get("action") == "delete")
+        edits = [r for r in (entry.get("results") or []) if r.get("action") == "text_edit" and r.get("ok")]
         bits = []
         if covers:
             bits.append(f"覆盖{covers}处")
@@ -1513,6 +1823,9 @@ def excerpt_working(proj: dict[str, Any], *, max_chars: int = 600) -> str:
             bits.append(f"新增{inserts}处")
         if deletes:
             bits.append(f"删除{deletes}处")
+        if edits:
+            pairs = "；".join(f"「{e.get('from')}」→「{e.get('text')}」" for e in edits[:4])
+            bits.append(f"改文字{len(edits)}处（{pairs}）")
         if bits:
             line += "，" + "、".join(bits)
         lines.append(line)

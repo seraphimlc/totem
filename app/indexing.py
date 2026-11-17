@@ -247,24 +247,21 @@ def collect_inserts(doc, layout, on_progress: Optional[Callable[[int, int], None
     return out
 
 
-def _clean_dxf_text(raw: Any) -> str:
-    """Keep visible wording; drop MTEXT format codes without swallowing the text."""
-    text = str(raw or "")
-    if not text.strip():
-        return ""
-    # {\\C50; 餐厅} -> 餐厅; font-wrapped equipment labels keep their wording.
-    text = re.sub(r"\{\\([^;]*);([^{}]*)\}", r"\2", text)
-    text = re.sub(r"\\[A-Za-z][^;]*;", "", text)
-    text = text.replace("\\P", " ").replace("\\p", " ").replace("\\~", " ")
-    text = re.sub(r"[{}]", "", text)
-    # Leftover font preamble if braces were already stripped: SimHei|b0|i0|c134|p49;汉字
-    text = re.sub(r"^[A-Za-z][^;\n]*\|[^;\n]*;", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+def clean_dxf_text(raw: Any) -> str:
+    """MTEXT 格式码 → 可见文字。唯一实现见 app.dxftext（标点原样保留）。"""
+    from . import dxftext
+
+    return dxftext.clean_mtext(raw)
+
+
+# 旧名保留给脚本与引用方，行为已换成共享清洗器。
+_clean_dxf_text = clean_dxf_text
 
 
 def collect_texts(doc, layout, on_progress: Optional[Callable[[int, int], None]] = None) -> list[dict[str, Any]]:
     """Collect TEXT/MTEXT in modelspace and inside inserted blocks, in world coordinates."""
+    from . import dxftext
+
     out: list[dict[str, Any]] = []
 
     def take_text(e, matrix, source: str, host: Optional[dict[str, Any]]) -> None:
@@ -272,20 +269,12 @@ def collect_texts(doc, layout, on_progress: Optional[Callable[[int, int], None]]
         if typ not in {"TEXT", "MTEXT", "ATTRIB", "ATTDEF"}:
             return
         try:
-            if typ == "MTEXT":
-                try:
-                    raw = e.plain_text() or ""
-                except Exception:
-                    raw = e.text or ""
-                if not str(raw).strip():
-                    raw = e.text or ""
-            else:
-                raw = e.dxf.text
-            text = _clean_dxf_text(raw)
+            text = dxftext.clean_entity_text(e)
             if not text:
                 return
             loc = e.dxf.insert
-            pt = Vec3(float(loc.x), float(loc.y), 0)
+            anchor = dxftext.primary_anchor(e) or [float(loc.x), float(loc.y)]
+            pt = Vec3(float(anchor[0]), float(anchor[1]), 0)
             if matrix is not None:
                 pt = matrix.transform(pt)
             xy = [round(float(pt.x), 3), round(float(pt.y), 3)]

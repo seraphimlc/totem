@@ -75,7 +75,7 @@ def extract_assistant_payload(text: str) -> Optional[dict[str, Any]]:
     data = extract_json(text)
     if not data:
         return None
-    keys = {"mode", "reply", "analysis", "inserts", "pipes", "texts", "deletes", "replaces", "moves", "do_not_touch", "room", "sheet"}
+    keys = {"mode", "reply", "analysis", "inserts", "pipes", "texts", "text_edits", "deletes", "replaces", "moves", "do_not_touch", "room", "sheet"}
     if keys.intersection(data.keys()):
         return data
     return None
