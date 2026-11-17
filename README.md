@@ -1,6 +1,8 @@
 # 图腾 · 改图工作台
 
-用自然语言提出改图方案，在当前图纸的局部预览上叠笔迹。v1 只出方案，不写入正式 DXF / DWG。
+用自然语言提出改图方案，在当前图纸的局部预览上叠笔迹。
+
+方案本身只做预览、不落盘；用户点「确认」后才写入会话的工作图 `.studio/work.dxf`，并同步更新该会话的 DXF（`out/source.dxf`，用于下载与预览），可以用「撤回」逐步恢复。**上传的原始文件始终保留在 `source/` 下，不会被覆盖。**
 
 线上计划地址：https://cad.visitworld.me
 
@@ -55,9 +57,9 @@ Windows 说明：
 
 - 中文字体自动选 `C:\Windows\Fonts\msyh.ttc` 等系统字体；也可用 `CAD_CJK_FONT` / `CAD_CJK_FONT_BOLD` 指定字体文件。Linux 仍用 Noto CJK。
 - 队列锁在 Windows 上走 `msvcrt.locking`（见 `app/filelock.py`），语义与 Linux 的 `flock` 一致，仍然只支持单进程 worker。
-- 没有 `dwg2dxf`（LibreDWG / ODA 转换器）时只能上传 DXF。若本机装了 dwg2dxf，用 `CAD_DWG2DXF` 指向可执行文件；否则上传 DWG 会提示先在 AutoCAD 里另存为 DXF。
+- DWG 需要转换器，服务器会先找 ODA File Converter，再找 dwg2dxf（LibreDWG）。本机装了 ODA 时用 `CAD_ODA_PATH` 指向 `ODAFileConverter.exe`（Windows 上一般必填，ezdxf 不会自己读这个变量）；装了 dwg2dxf 时用 `CAD_DWG2DXF` 指向可执行文件。两者都没有时只能上传 DXF，上传 DWG 会提示先在 AutoCAD 里另存为 DXF。详见下文「DWG 转 DXF」。
 - 组件库 / 配置查找支持环境变量覆盖：`CAD_LIBRARY_INDEX`（索引 JSON）、`CAD_LIBRARY_DXF_DIR`（图块 DXF 目录），之后才回落到 Linux 生产路径和项目内 `var/`。
-- 自造 DXF 的冒烟测试不依赖真实图纸：`.venv\Scripts\python.exe scripts\test_preview_sanitize.py`、`.venv\Scripts\python.exe scripts\test_index_sqlite.py`。依赖真实样本图的 `scripts\test_apply_preview.py`、`scripts\test_scene.py`、`scripts\session_tests.py` 在没有样本时会打印 `SKIP` 并以 0 退出，可用 `TUTENG_DXF_FIXTURE`、`TUTENG_CANTEEN_DXF`、`TUTENG_MALL_DXF`、`TUTENG_ROOT` 指向样本。
+- 自造 DXF 的冒烟测试不依赖真实图纸：`.venv\Scripts\python.exe scripts\test_preview_sanitize.py`、`.venv\Scripts\python.exe scripts\test_index_sqlite.py`、`.venv\Scripts\python.exe scripts\test_convert.py`（DWG 转换层，没装 ODA / dwg2dxf 也能跑）。依赖真实样本图的 `scripts\test_apply_preview.py`、`scripts\test_scene.py`、`scripts\session_tests.py` 在没有样本时会打印 `SKIP` 并以 0 退出，可用 `TUTENG_DXF_FIXTURE`、`TUTENG_CANTEEN_DXF`、`TUTENG_MALL_DXF`、`TUTENG_ROOT` 指向样本。
 
 ## 环境变量
 
@@ -73,10 +75,33 @@ Windows 说明：
 | `HOST` / `PORT` | 本地可绑定 `0.0.0.0:8780`；生产由 systemd 绑 `127.0.0.1:8780` |
 | `CAD_DATA_DIR` | 生产上项目目录的父路径（下面仍用「学生食堂」「万商城3号楼给排水」这两个子目录名） |
 | `CAD_PROJECT_XUESHENGSHITANG` / `CAD_PROJECT_WANSHANGCHENG` | 可选，绝对路径覆盖，不必移动原目录 |
+| `CAD_DWG_CONVERTER` | 可选，`auto`（默认）/ `oda` / `dwg2dxf` / `none`，决定 DWG 用哪个转换器 |
+| `CAD_ODA_PATH` | 可选，ODA File Converter 可执行文件绝对路径 |
+| `CAD_ODA_TIMEOUT` | 可选，单次 ODA 转换超时（秒），默认 `180` |
+| `CAD_DWG2DXF` | 可选，dwg2dxf 可执行文件绝对路径 |
+| `CAD_DWG2DXF_TIMEOUT` | 可选，单次 dwg2dxf 超时（秒），默认 `180` |
+| `CAD_DWG_CONVERT_TMPDIR` | 可选，DWG 转换中间目录；默认是输出文件旁的 `.convert-tmp` |
+| `CAD_DWG_CONVERT_BUDGET` | 可选，一次上传里所有转换器合计的时间上限（秒），默认 `270` |
 
 模型只有 `Tifa-6.1-sol`（默认）和 `Tifa-6-astra`。Sol 若拒绝图片会自动改成纯文字再请求。Astra 会带上当前局部预览。
 
 叠图标签依赖本机字体 `/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc`（Debian / Ubuntu 包装 `fonts-noto-cjk`）。预览渲染用 ezdxf + matplotlib。
+
+## DWG 转 DXF
+
+上传 `.dwg` 时，服务器按 `CAD_DWG_CONVERTER` 决定工具链（默认 `auto`）：
+
+1. **ODA File Converter**（推荐）。先用 ezdxf 的 `odafc` 封装，失败再按 ODA 的 CLI 约定直接调用；两段都只看输出目录里有没有能打开的 DXF，不看返回码。
+2. **dwg2dxf**（LibreDWG，GPLv3）。没装 ODA、或 `auto` 下 ODA 失败时兜底。
+
+两条路都失败、或一个都没装时，上传 DWG 会提示先在 AutoCAD 里另存为 DXF（建议 AC1021）。设 `CAD_DWG_CONVERTER=none` 可以彻底关闭 DWG 转换。转换结果会统一规范成 UTF-8；原始上传文件不会被覆盖。
+
+服务器安装说明（Debian / Ubuntu）：
+
+- ODA：从 Open Design Alliance 下载免费版 ODA File Converter 自行安装，然后在 `/opt/cad-studio/.env` 里写 `CAD_ODA_PATH=/opt/.../ODAFileConverter`。它是带界面的程序，无桌面的服务器需要 `apt install xvfb`（`odafc` 会自己起 Xvfb；没有 Xvfb 时要求存在 `DISPLAY`），否则 ODA 这条路会被跳过。
+- dwg2dxf：`apt install libredwg`（或自行编译后放到 `/opt/cad-tools/prefix/bin/dwg2dxf`），再用 `CAD_DWG2DXF` 指向它。LibreDWG 是 GPLv3，本仓库与 `deploy/` 都不打包它，只按路径调用。
+- 自检：`python -c "from ezdxf.addons import odafc; print(odafc.is_installed())"`，以及 `.venv/bin/python scripts/test_convert.py`（不需要真实图纸）。
+- 转换超时受 `CAD_DWG_CONVERT_BUDGET`（默认 270 秒）封顶，落在 Nginx 对 `/api/` 的 `proxy_read_timeout 300s` 之内。
 
 ## 部署概要
 
@@ -86,7 +111,7 @@ Windows 说明：
 2. 在本机运行 `deploy/pack.sh`，得到不含密钥、不含源 DWG / PDF / 图库的精简目录。
 3. 将精简目录同步到 `/opt/cad-studio/current/`。项目数据可放在 `current/data/`，或单独放在 `/opt/cad-studio/data/` 并设置 `CAD_DATA_DIR`。
 4. 写入 `/opt/cad-studio/.env`，权限 `600`，至少包含 `MAAS_*`、`ACCESS_*`、`SESSION_SECRET`、`CAD_DATA_DIR`。生产绑定已写在 unit 里：`127.0.0.1:8780`。上 HTTPS 后设 `SESSION_SECURE=1`。
-5. 在 `/opt/cad-studio/current` 建立 `.venv` 并 `pip install -r requirements.txt`。系统安装 `fonts-noto-cjk`。
+5. 在 `/opt/cad-studio/current` 建立 `.venv` 并 `pip install -r requirements.txt`。系统安装 `fonts-noto-cjk`。需要直接接收 DWG 时，再按「DWG 转 DXF」一节装 ODA File Converter（配 `xvfb`）或 dwg2dxf；都不装就只能上传 DXF。
 6. 安装 `deploy/cad-studio.service`（默认用户 `cad`，需先建该用户）。先放 `deploy/nginx-cad.visitworld.me.conf`（只开 80，ACME 目录 `/opt/visitworld-deploy/acme`）。证书签发后再换成 `nginx-cad.visitworld.me.tls.conf.example`。
 7. 启动服务并 `nginx -t && reload`。
 

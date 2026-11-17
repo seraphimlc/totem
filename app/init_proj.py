@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import shutil
 import threading
@@ -541,128 +540,49 @@ def _ensure_dxf(proj: dict[str, Any], st: dict[str, Any]) -> Path:
     raise ValueError("只接受 DWG 或 DXF 图纸。")
 
 
-def _windows_dwg2dxf_candidates() -> list[str]:
-    """Extra lookup paths for Windows installs (LibreDWG / ODA builds)."""
-    found: list[str] = []
-    local = (os.getenv("LOCALAPPDATA") or "").strip()
-    if local:
-        programs = Path(local) / "Programs"
-        found.extend(str(p) for p in programs.glob("**/dwg2dxf.exe"))
-        found.extend(str(p) for p in programs.glob("**/bin/dwg2dxf.exe"))
-    for base in (r"C:\Program Files\DWG", r"C:\Program Files\LibreDWG", r"C:\Program Files (x86)\DWG"):
-        try:
-            if Path(base).is_dir():
-                found.extend(str(p) for p in Path(base).glob("**/dwg2dxf.exe"))
-        except OSError:
-            continue
-    return found
-
-
-def _which_where(name: str) -> str:
-    """shutil.which, then the Windows `where` command for shims it misses."""
-    hit = shutil.which(name)
-    if hit:
-        return hit
-    if os.name != "nt":
-        return ""
-    try:
-        import subprocess
-        proc = subprocess.run(
-            ["where", name],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=15,
-        )
-    except Exception:
-        return ""
-    for line in (proc.stdout or "").splitlines():
-        line = line.strip()
-        if line and Path(line).is_file():
-            return line
-    return ""
+# DWG → DXF 的实现已挪到 app/convert/（ODA 优先，dwg2dxf 兜底）。
+# 下面两个函数保留旧名字与旧签名，上传初始化不用改。
 
 
 def find_dwg2dxf() -> Optional[str]:
-    env = (os.getenv("CAD_DWG2DXF") or "").strip()
-    candidates = [
-        env,
-        "/tmp/cad-tools/prefix/bin/dwg2dxf",
-        "/opt/cad-tools/prefix/bin/dwg2dxf",
-        "/opt/cad-studio/tools/bin/dwg2dxf",
-        "/usr/local/bin/dwg2dxf",
-        shutil.which("dwg2dxf") or "",
-    ]
-    if os.name == "nt":
-        candidates.extend(_windows_dwg2dxf_candidates())
-        candidates.append(_which_where("dwg2dxf"))
-        candidates.append(_which_where("dwg2dxf.exe"))
-    for path in candidates:
-        if path and Path(path).is_file() and os.access(path, os.X_OK):
-            return path
-    return None
+    """旧接口：只找 dwg2dxf。完整工具链见 app.convert.find_converter()。"""
+    from . import convert
+
+    return convert.find_dwg2dxf()
+
+
+def _windows_dwg2dxf_candidates() -> list[str]:
+    """旧接口，实现在 app/convert/dwg2dxf.py，Windows 探测路径不变。"""
+    from .convert import dwg2dxf
+
+    return dwg2dxf._windows_dwg2dxf_candidates()
+
+
+def _which_where(name: str) -> str:
+    """旧接口，实现在 app/convert/dwg2dxf.py。"""
+    from .convert import dwg2dxf
+
+    return dwg2dxf._which_where(name)
 
 
 def convert_dwg(src: Path, dest: Path) -> Path:
-    tool = find_dwg2dxf()
-    if not tool:
-        raise ValueError("服务器目前不能直接读取 DWG。请先在 AutoCAD 里另存为 DXF（建议 AC1021）后再上传。")
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp_dir = dest.parent / ".convert-tmp"
-    if tmp_dir.exists():
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    # dwg2dxf writes next to the source by default; copy first.
-    tmp_src = tmp_dir / src.name
-    shutil.copy2(src, tmp_src)
-    import subprocess
+    """把 DWG 转成 DXF。失败抛 ValueError，文案与改动前一致。
 
-    def _run(argv):
-        return subprocess.run(
-            argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180
-        )
+    工具选择与子进程细节在 app/convert/；这里只负责把结构化错误翻译成
+    用户能看到的中文，并保证 ``_ensure_dxf()`` 的调用方式不变。
+    """
+    from . import convert
 
-    # dwg2dxf takes the output *file* with -o, not a directory, and it can exit 0
-    # while printing "WRITE ERROR", so the artefact is the only proof of success.
-    out_dxf = tmp_dir / "source.dxf"
-    if out_dxf.exists():
-        out_dxf.unlink()
-    proc = _run([tool, "-y", "-o", str(out_dxf), str(tmp_src)])
-    if not (out_dxf.is_file() and out_dxf.stat().st_size > 0):
-        # Some builds only accept the input path and write next to it.
-        proc = _run([tool, "-y", str(tmp_src)])
-        produced = sorted(tmp_dir.glob("*.dxf")) + sorted(tmp_dir.glob("*.DXF"))
-        if not produced:
-            detail = ((proc.stderr or "") + (proc.stdout or "")).strip().splitlines()
-            hint = detail[-1] if detail else "没有输出"
-            raise ValueError("DWG 转换没有成功（%s）。请改传 DXF，或检查原文件是否完好。" % hint)
-        out_dxf = produced[0]
-    shutil.copy2(out_dxf, dest)
-    shutil.rmtree(tmp_dir, ignore_errors=True)
-    # Normalize to UTF-8 when possible. ezdxf can choke on tables produced by
-    # dwg2dxf, and a failed saveas truncates whatever file it is writing, so the
-    # normalized copy goes to a scratch file and only replaces dest on success.
-    norm_tmp = dest.with_name(dest.name + ".normalize.tmp")
     try:
-        doc = ezdxf.readfile(str(dest))
-        try:
-            from . import cad_render
-            n = cad_render.sanitize_doc_text_backgrounds(doc)
-            if n:
-                log.info("sanitized %s corrupt text backgrounds in %s", n, dest)
-        except Exception:
-            log.exception("could not sanitize text backgrounds in %s", dest)
-        doc.saveas(str(norm_tmp), encoding="utf-8")
-        norm_tmp.replace(dest)
-    except Exception:
-        log.exception("could not normalize converted dxf, keeping the raw conversion")
-        try:
-            if norm_tmp.exists():
-                norm_tmp.unlink()
-        except OSError:
-            pass
-    return dest
+        result = convert.convert_dwg(src, dest)
+    except convert.ConvertError as exc:
+        log.warning("DWG conversion failed: code=%s detail=%s", exc.code, exc.detail)
+        if exc.code == "no_converter":
+            raise ValueError(convert.MSG_NO_TOOL) from exc
+        raise ValueError(convert.MSG_FAILED % (exc.detail or "没有输出")) from exc
+    if result.warnings:
+        log.info("DWG conversion warnings: %s", "; ".join(result.warnings))
+    return Path(result.output_path or dest)
 
 
 def _pick_default_sheet(proj: dict[str, Any]) -> None:
