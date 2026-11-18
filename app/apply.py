@@ -41,7 +41,6 @@ def _with_project_write_lock(fn):
 MAX_REVISIONS = 5
 NEW_LAYER_PREFIX = "图腾-新增"
 NEAR_MM = 400.0
-COVER_PAD_MM = 20.0
 STAMP_PREVIEW = "方案预览，尚未写入工作图"
 DIRTY_POINT_EXTENT = 1200.0
 DIRTY_PAD = 800.0
@@ -424,24 +423,11 @@ def _world_forward(matrix: Matrix44, local_fwd: tuple[float, float]):
     return (p1.x - p0.x, p1.y - p0.y)
 
 
-def _world_bbox(doc, name: str, matrix: Matrix44) -> Optional[tuple[float, float, float, float]]:
-    ext = _block_extents(doc, name)
-    if ext is None:
-        origin = matrix.transform(Vec3(0, 0, 0))
-        return (origin.x - 50, origin.y - 50, origin.x + 50, origin.y + 50)
-    corners = [
-        (ext.extmin.x, ext.extmin.y),
-        (ext.extmax.x, ext.extmin.y),
-        (ext.extmax.x, ext.extmax.y),
-        (ext.extmin.x, ext.extmax.y),
-    ]
-    pts = [matrix.transform(Vec3(x, y, 0)) for x, y in corners]
-    xs = [p.x for p in pts]
-    ys = [p.y for p in pts]
-    return (min(xs), min(ys), max(xs), max(ys))
+AMBIGUITY_MM = 300.0   # 同名块第二近的一处离模型给的点没有明显更远（差 < 300mm）→ 不猜
 
 
-def _find_insert(msp, block: str, xy, bbox, pad: float = 2000.0):
+def _find_symbol_hits(msp, block: str, xy, bbox, pad: float = 2000.0):
+    """当前分区里块名匹配的全部顶层候选 [(dist, entity, pt)]（按距离排序）。"""
     hits = []
     for e in msp.query("INSERT"):
         try:
@@ -458,7 +444,174 @@ def _find_insert(msp, block: str, xy, bbox, pad: float = 2000.0):
             dist = 0.0 if xy is None else abs(pt[0] - float(xy[0])) + abs(pt[1] - float(xy[1]))
             hits.append((dist, e, pt))
     hits.sort(key=lambda t: t[0])
-    return hits[0] if hits else None
+    return hits
+
+
+def _nearest_of(hits, ambiguous: Optional[dict[str, Any]] = None):
+    """最近的候选；有第二处几乎一样近时返回 ambiguous（不猜），否则返回第一项。"""
+    if not hits:
+        return None
+    if len(hits) >= 2 and abs(hits[1][0] - hits[0][0]) < AMBIGUITY_MM:
+        return ambiguous if ambiguous is not None else None
+    return hits[0]
+
+
+def _find_insert(msp, block: str, xy, bbox, pad: float = 2000.0):
+    """当前分区里的顶层同名 INSERT；等距/近似等距的多处视为歧义，返回 None。
+
+    真正要区分「歧义」和「没找到」的调用方用 ``_find_symbol_hits`` / ``_locate_target``。
+    """
+    return _nearest_of(_find_symbol_hits(msp, block, xy, bbox, pad=pad))
+
+
+def _checked_rotation(value) -> Optional[float]:
+    """旋转角：None 表示不改；布尔/NaN/Infinity/字符串一律拒绝（先算再写，避免动了一半）。"""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"旋转角「{value}」不是数字")
+    deg = float(value)
+    if not math.isfinite(deg):
+        raise ValueError("旋转角不是有限数字")
+    return _normalize_deg(deg)
+
+
+def _locate_target(doc, msp, block: str, xy, bbox, *, pad: float = 2000.0) -> dict[str, Any]:
+    """找到要动的 INSERT 并做入口校验：返回 ``{"found": rec}`` 或 ``{"ok": False, ...}``。
+
+    - 顶层多处同名块、模型给的点分不出哪一处（差 < AMBIGUITY_MM）→ 歧义，不猜；
+    - 嵌套在共享图块内部的目标 → 拒绝（``nested_not_supported``）。嵌套区块里画在 0 层的
+      内容一律显示在块**内部**中位置最低的那个非 0 图层，不是它自己的 INSERT 层；
+    - 空图层 / 图层被关掉的块 → 拒绝（``hidden_not_supported``）；
+    - 显示图层（``effective_layer``）在保护层，或者块里有任何落在保护层的内容
+      （``analyze_insert``：嵌套插入、块内文字、属性，判不清也算）→ 拒绝。
+    """
+    from . import planschema
+
+    hits = _find_symbol_hits(msp, block, xy, bbox, pad=pad)
+    nearest = _nearest_of(hits)
+    if nearest is None and hits:
+        return _ambiguous(block, xy)
+    if nearest is None:
+        best = None
+        for host in msp.query("INSERT"):
+            try:
+                name = host.dxf.name
+                if name not in doc.blocks:
+                    continue
+                hip = host.dxf.insert
+                if bbox and not _in_region([float(hip.x), float(hip.y)], bbox, pad=20000.0):
+                    continue
+                hm = host.matrix44()
+            except Exception:
+                continue
+            found = _search_nested(doc, doc.blocks.get(name), hm, block, xy, bbox, depth=1, host=host)
+            if not found:
+                continue
+            if best is not None and abs(best["dist"] - found["dist"]) < AMBIGUITY_MM:
+                return _ambiguous(block, xy)
+            if best is None or found["dist"] < best["dist"]:
+                found["host_name"] = name
+                best = found
+        if best is None:
+            return {"ok": False, "reason": f"当前分区里没有找到「{block}」", "block": block, "xy": None}
+        return _nested_rejection(block, best)
+    _, ent, pt = nearest
+    try:
+        matrix = ent.matrix44()
+    except Exception:
+        matrix = Matrix44.translate(pt[0], pt[1], 0)
+    target = {
+        "kind": "direct",
+        "entity": ent,
+        "host": None,
+        "xy": pt,
+        "rot": float(ent.dxf.rotation or 0),
+        "matrix": matrix,
+        "name": block,
+        "dist": 0.0 if xy is None else abs(pt[0] - float(xy[0])) + abs(pt[1] - float(xy[1])),
+    }
+    layer = planschema.effective_layer(ent)
+    try:
+        raw = str(ent.dxf.layer or "").strip()
+    except Exception:
+        raw = ""
+    if raw == "" or _layer_hidden(doc, layer):
+        return {
+            "ok": False,
+            "reason": f"「{block}」所在的图层是空图层或被关掉了，看不出来它显示在哪里，这次没有动它",
+            "block": block,
+            "xy": pt,
+            "issue_code": "hidden_not_supported",
+            "layer": layer,
+        }
+    protected = planschema.protected_pattern(layer)
+    if protected:
+        return {
+            "ok": False,
+            "reason": f"「{block}」显示在保护图层「{layer}」（含「{protected}」）上，图框、图签、标题不改",
+            "block": block,
+            "xy": pt,
+            "issue_code": "protected_layer",
+            "layer": layer,
+        }
+    analysis = planschema.analyze_insert(ent)
+    if analysis.get("protected"):
+        return {
+            "ok": False,
+            "reason": _content_reason(block, analysis),
+            "block": block,
+            "xy": pt,
+            "issue_code": "protected_layer",
+            "layer": layer,
+        }
+    return {"found": target}
+
+
+def _ambiguous(block: str, xy) -> dict[str, Any]:
+    point = [float(xy[0]), float(xy[1])] if xy else None
+    return {
+        "ok": False,
+        "reason": f"「{block}」在附近有多处，分不出是哪一处，请给出更准确的位置",
+        "block": block,
+        "xy": point,
+        "issue_code": "ambiguous_target",
+    }
+
+
+def _layer_hidden(doc, name: str) -> bool:
+    try:
+        layer = doc.layers.get(name)
+        return bool(layer is not None and (layer.is_off() or layer.is_frozen()))
+    except Exception:
+        return False
+
+
+def _content_reason(name: str, analysis: dict[str, Any]) -> str:
+    """说明为什么整块不能动：块里有保护图层的内容，或者这块的显示判不清。"""
+    where = str(analysis.get("protected_where") or "")
+    if where:
+        return f"「{name}」块里有保护图层「{where}」上的内容（图框、图签、标题），删它、移它或换掉它会把这些一起带走，不改"
+    if analysis.get("xref"):
+        return f"「{name}」是外部参照，内容不在本图里，不改"
+    if analysis.get("mirrored"):
+        return f"「{name}」是镜像插入，块里 0 层的内容显示在哪层判不准，不改"
+    if analysis.get("cycle") or analysis.get("depth"):
+        return f"「{name}」的块引用成环或嵌套太深，判不清里面有没有图框、图签内容，不改"
+    return f"「{name}」的显示图层判不清（块缺失、内容读不了或嵌套成环），不改"
+
+
+def _nested_rejection(name: str, found: dict[str, Any]) -> dict[str, Any]:
+    """嵌套在共享图块里的目标：内部约定不改块定义，模型空间也覆盖不住块内图元，一律不写。"""
+    host = str(found.get("host_name") or "").strip()
+    where = f"在共享图块「{host}」内部，" if host else "在别的图块内部，"
+    return {
+        "ok": False,
+        "reason": f"「{name}」{where}这个位置不支持修改，这次没有动它",
+        "block": name,
+        "xy": found.get("xy"),
+        "issue_code": "nested_not_supported",
+    }
 
 
 def _compose_child_matrix(entity, parent: Matrix44) -> Matrix44:
@@ -503,7 +656,12 @@ def _search_nested(doc, layout, parent_m: Matrix44, target: str, xy, bbox, *, de
 
 
 def find_symbol(doc, msp, block: str, xy, bbox) -> Optional[dict[str, Any]]:
-    """Locate a top-level modelspace INSERT, or a nested INSERT in this view only."""
+    """Locate a top-level modelspace INSERT (kind="direct"), or look inside host blocks.
+
+    A nested hit is returned with kind="overlay" so the old assertions can tell it apart,
+    but nothing is ever written for it: writes go through ``_locate_target``, which rejects
+    nested targets (see ``_nested_rejection``).
+    """
     hit = _find_insert(msp, block, xy, bbox)
     if hit:
         _, ent, pt = hit
@@ -536,41 +694,10 @@ def find_symbol(doc, msp, block: str, xy, bbox) -> Optional[dict[str, Any]]:
             continue
         found = _search_nested(doc, doc.blocks.get(name), hm, block, xy, bbox, depth=1, host=host)
         if found and (best is None or found["dist"] < best["dist"]):
+            found["kind"] = "overlay"
+            found["host_name"] = name
             best = found
     return best
-
-
-def _add_cover(msp, world_bb: tuple[float, float, float, float], layer: str) -> dict[str, Any]:
-    x0, y0, x1, y1 = world_bb
-    pad = COVER_PAD_MM
-    verts = [
-        (x0 - pad, y0 - pad),
-        (x1 + pad, y0 - pad),
-        (x1 + pad, y1 + pad),
-        (x0 - pad, y1 + pad),
-    ]
-    try:
-        wipe = msp.add_wipeout(verts, dxfattribs={"layer": layer})
-        # ezdxf's add_wipeout ignores layer in dxfattribs and leaves it on "0".
-        try:
-            wipe.dxf.layer = layer
-        except Exception:
-            pass
-        return {"ok": True, "action": "cover", "kind": "wipeout", "bbox": [x0, y0, x1, y1], "layer": layer, "handle": wipe.dxf.handle}
-    except Exception:
-        log.exception("wipeout cover failed, falling back")
-    try:
-        hatch = msp.add_hatch(color=7, dxfattribs={"layer": layer, "true_color": 0xFFFFFF})
-        hatch.set_solid_fill(color=7)
-        hatch.paths.add_polyline_path(verts, is_closed=True)
-        return {"ok": True, "action": "cover", "kind": "hatch", "bbox": [x0, y0, x1, y1], "layer": layer, "handle": hatch.dxf.handle}
-    except Exception:
-        log.exception("hatch cover failed, falling back")
-    try:
-        solid = msp.add_solid(verts, dxfattribs={"layer": layer, "color": 7, "true_color": 0xFFFFFF})
-        return {"ok": True, "action": "cover", "kind": "solid", "bbox": [x0, y0, x1, y1], "layer": layer, "handle": solid.dxf.handle}
-    except Exception as exc:
-        return {"ok": False, "reason": f"无法覆盖旧符号：{exc}"}
 
 
 def _choose_rotation(doc, item: dict[str, Any], found: Optional[dict[str, Any]], new_name: str) -> float:
@@ -621,17 +748,47 @@ def _add_insert(
     snapped = bool(snap_notes) and xy != planned_xy
     if not _in_region(xy, bbox):
         return {"ok": False, "reason": "坐标不在当前分区内", "block": name, "xy": xy}
-    if name not in doc.blocks and not _import_block(doc, name):
-        return {"ok": False, "reason": f"图纸和默认组件库里都没有块「{name}」", "block": name}
     layer_name = _ensure_layer(doc, layer)
     sx, sy, sz = _scale_tuple(item.get("scale"))
     rot = _choose_rotation(doc, item, found, name)
-    ref = msp.add_blockref(
-        name,
-        insert=xy,
-        dxfattribs={"layer": layer_name, "rotation": rot, "xscale": sx, "yscale": sy, "zscale": sz},
-    )
+    imported = False
+    # 探测一律在隔离副本里做：本图一个像素都不加，绝不让「新块」绕过保护判断，也不在调用方
+    # 的图里留下试插的实体。库里的块（外加本图已有的定义 / 图层，让 0 层继承看出真实图层）
+    # 一起放进副本，重复插同一个块也看得见。
+    work = _import_isolated(name, layer_sources=doc, base=doc)
+    if work is None:
+        return {"ok": False, "reason": f"图纸和默认组件库里都没有块「{name}」", "block": name, "xy": xy}
+    imported = name not in doc.blocks
+    try:
+        probe = work.modelspace().add_blockref(
+            name,
+            insert=xy,
+            dxfattribs={"layer": layer_name, "rotation": rot, "xscale": sx, "yscale": sy, "zscale": sz},
+        )
+    except Exception as exc:
+        return {"ok": False, "reason": f"块「{name}」插入失败，这一处没有写：{exc}", "block": name, "xy": xy}
+    check = _guard_new_block(work, probe, found)
+    if check:
+        return check
+    # 守卫通过后才往本图里导入库块；插失败就把刚导入的块定义撤回。
+    if imported and name not in doc.blocks and not _import_block(doc, name):
+        return {"ok": False, "reason": f"图纸和默认组件库里都没有块「{name}」", "block": name, "xy": xy}
+    created = []
+    try:
+        ref = msp.add_blockref(
+            name,
+            insert=xy,
+            dxfattribs={"layer": layer_name, "rotation": rot, "xscale": sx, "yscale": sy, "zscale": sz},
+        )
+        created.append(ref)
+    except Exception as exc:
+        # 插了一半（add_blockref 抛错也可能已经建了实体）：在写盘前把这次新建的都撤掉。
+        if imported:
+            _remove_insert_probe(doc, msp, created, name)
+        return {"ok": False, "reason": f"块「{name}」插入失败，这一处没有写：{exc}", "block": name, "xy": xy}
     out = {"ok": True, "action": "insert", "block": name, "xy": xy, "layer": layer_name, "rot": rot, "handle": ref.dxf.handle}
+    if imported:
+        out["imported"] = True
     if snapped:
         out["snapped"] = True
         out["snap_notes"] = snap_notes
@@ -644,6 +801,43 @@ def _add_insert(
             pass
     return out
 
+
+def _import_isolated(name: str, *, layer_sources=None, base=None):
+    """在副本里导入一个库块，用来在写本图之前查清它的内容；库/图纸里都没有返回 None。
+
+    ``layer_sources`` 里的图层先抄进副本（块里的 0 层内容要看插入图层是否受保护，副本
+    没有的图层会被当成假的层面），``base`` 是本图已有的块定义先抄进副本（同名的块以
+    本图为准）。副本与原图互不影响：探测用的 INSERT 只加在副本里。
+    """
+    try:
+        work = ezdxf.new("R2010", setup=True)
+    except Exception:
+        return None
+    try:
+        if layer_sources is not None:
+            for layer in getattr(layer_sources, "layers", []):
+                try:
+                    if layer.dxf.name not in work.layers:
+                        work.layers.add(layer.dxf.name, dxfattribs={"color": int(layer.dxf.color)})
+                except Exception:
+                    continue
+        if base is not None:
+            for block in getattr(base, "blocks", []):
+                if block.name in work.blocks:
+                    continue
+                try:
+                    from ezdxf.addons.importer import Importer
+
+                    importer = Importer(base, work)
+                    importer.import_blocks([block.name])
+                    importer.finalize()
+                except Exception:
+                    continue
+        if name in work.blocks or (name not in getattr(base, "blocks", {}) and _import_block(work, name)):
+            return work
+    except Exception:
+        log.exception("isolated import of %s failed", name)
+    return None
 
 
 def _attrib_values(insert) -> dict[str, str]:
@@ -741,32 +935,213 @@ def _snap_before_insert(
         return xy, []
 
 
+def _owner_layout(msp, ent):
+    """实体所在的布局；apply 只动模型空间里的顶层 INSERT，其他布局里的同句柄实体不动。"""
+    try:
+        if ent.get_layout() is msp:
+            return msp
+    except Exception:
+        pass
+    return None
+
+
+def _gone(ent) -> bool:
+    """实体是不是已经从图里删掉了：销毁了，或者已经不再挂在任何文档上。"""
+    try:
+        return (not ent.is_alive) or getattr(ent, "doc", None) is None
+    except Exception:
+        return True
+
+
+def _delete_direct(msp, found: dict[str, Any]) -> dict[str, Any]:
+    """删掉一个顶层 INSERT：``Modelspace.delete_entity(entity)``（ezdxf 的公开签名只收实体）。
+
+    删掉了才报 ok；布局方法失败时再用 ``entity.destroy()`` 兜底（ezdxf 的 internal API，
+    会同时摘掉实体库里的记录）。两样都没删掉就如实报失败，绝不当成删成功。
+    """
+    ent = found.get("entity")
+    base = {"action": "delete", "block": found.get("name"), "xy": found.get("xy"), "found": found}
+    if ent is None or _gone(ent):
+        return {"ok": False, "reason": "要删的图块已经不在了", **base}
+    if _owner_layout(msp, ent) is None:
+        return {"ok": False, "reason": "这个图块不在模型空间里，没有删", **base}
+    try:
+        msp.delete_entity(ent)
+        if _gone(ent):
+            return {"ok": True, **base}
+    except Exception:
+        log.exception("delete_entity failed for %s, trying destroy()", found.get("name"))
+    try:
+        ent.destroy()
+    except Exception as exc:
+        return {"ok": False, "reason": f"删除失败，原图块还在：{exc}", **base}
+    if _gone(ent):
+        return {"ok": True, **base}
+    return {"ok": False, "reason": "删除失败，原图块还在", **base}
+
+
 def _hide_or_delete(doc, msp, item: dict[str, Any], bbox, layer: str) -> dict[str, Any]:
+    """删除项 / 替换时的旧块：只删顶层、显示图层不保护的 INSERT。"""
     name = str(item.get("block") or item.get("from_block") or "").strip()
     xy = _as_xy(item.get("xy") or item.get("from_xy") or item.get("from"))
     if not name or not xy:
         return {"ok": False, "reason": "删除需要块名和坐标", "item": item}
-    found = find_symbol(doc, msp, name, xy, bbox)
-    if not found:
-        return {"ok": False, "reason": f"当前分区里没有找到「{name}」", "block": name, "xy": xy}
-    if found["kind"] == "direct":
-        ent = found["entity"]
-        try:
-            msp.delete_entity(ent)
-        except Exception:
-            ent.destroy()
-        return {"ok": True, "action": "delete", "block": name, "xy": found["xy"], "found": found}
-    # Nested in a shared underlay: cover in this view's modelspace only.
-    bb = _world_bbox(doc, name, found["matrix"])
-    if not bb:
-        return {"ok": False, "reason": f"无法计算「{name}」的覆盖范围", "block": name, "xy": xy}
-    cover = _add_cover(msp, bb, layer)
-    if not cover.get("ok"):
-        return cover
-    cover["block"] = name
-    cover["xy"] = found["xy"]
-    cover["found"] = found
-    return cover
+    located = _locate_target(doc, msp, name, xy, bbox)
+    if not located.get("found"):
+        return {k: v for k, v in located.items() if k != "found"}
+    found = located["found"]
+    if found["kind"] != "direct" or _owner_layout(msp, found["entity"]) is None:
+        return {**_nested_rejection(name, found), "found": found}
+    return _delete_direct(msp, found)
+
+
+def _preflight_replace(doc, msp, old_item: dict[str, Any], item: dict[str, Any], bbox, new_xy) -> dict[str, Any]:
+    """替换写图前的检查：目标存在、不在保护层、不是共享块内部、新块插得进、坐标在分区内。
+
+    返回 ``{"found": rec}`` 表示可以写；否则返回失败结果（``reason`` / ``issue_code``）。
+    任何一项不成立都在动旧图块之前返回，保证「插不上也不丢旧块」。
+    """
+    name = str(old_item.get("block") or "").strip()
+    xy = _as_xy(old_item.get("xy")) or _as_xy(new_xy)
+    if not name or not xy:
+        return {"ok": False, "reason": "替换需要旧块名和坐标", "block": name}
+    located = _locate_target(doc, msp, name, xy, bbox)
+    if not located.get("found"):
+        return {k: v for k, v in located.items() if k != "found"}
+    found = located["found"]
+    if found["kind"] != "direct":
+        return _nested_rejection(name, found)
+    new_name = str(item.get("block") or "").strip()
+    if not new_name:
+        return {"ok": False, "reason": "替换缺少新块名", "block": name}
+    if new_name not in doc.blocks and not _block_available(new_name):
+        return {"ok": False, "reason": f"图纸和默认组件库里都没有块「{new_name}」，原图块保留", "block": new_name}
+    if new_xy is None:
+        new_xy = found["xy"]
+    if not _in_region(new_xy, bbox):
+        return {"ok": False, "reason": "新块坐标不在当前分区内，原图块保留", "block": new_name, "xy": new_xy, "issue_code": "out_of_region"}
+    return {"found": found}
+
+
+def _guard_new_block(doc, ref, found: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """新插 / 新导入的块是否有保护图层的内容、是否落进保护图层；有问题返回失败结果。"""
+    from . import planschema
+
+    name = str(ref.dxf.name)
+    layer = str(ref.dxf.layer or "")
+    hit = planschema.protected_pattern(layer)
+    if hit:
+        return {
+            "ok": False,
+            "reason": f"新块「{name}」不能放到保护图层「{layer}」（含「{hit}」）上",
+            "block": name,
+            "issue_code": "protected_layer",
+            "layer": layer,
+        }
+    analysis = planschema.analyze_insert(ref)
+    if analysis.get("protected_where"):
+        return {
+            "ok": False,
+            "reason": _content_reason(name, analysis),
+            "block": name,
+            "issue_code": "protected_layer",
+        }
+    if found and found.get("kind") == "direct":
+        old_layer = _layer_name(found.get("entity"))
+        if old_layer and planschema.is_protected_layer(planschema.effective_layer(found["entity"])):
+            return {
+                "ok": False,
+                "reason": f"被替换的「{found.get('name')}」在保护图层「{old_layer}」上，不换",
+                "block": name,
+                "issue_code": "protected_layer",
+            }
+    return None
+
+
+def _remove_entity(msp, ent) -> bool:
+    """删掉刚插上、还没写盘的一个实体（失败就 restore 兜底，不影响旧图）。
+
+    ``delete_entity`` / ``destroy`` 都失败时（例如它们被换成了会抛错的实现），按 ezdxf 删除的
+    两步手动摘掉（从布局、从实体库）：只有这一个刚建、还没写盘的实体走这条路，不碰旧图。
+    """
+    try:
+        msp.delete_entity(ent)
+        if _gone(ent):
+            return True
+    except Exception:
+        log.exception("remove entity failed")
+    try:
+        ent.destroy()
+        if _gone(ent):
+            return True
+    except Exception:
+        log.exception("destroy entity failed")
+    try:
+        from ezdxf.layouts.base import BaseLayout
+
+        layout = ent.get_layout()
+        BaseLayout.unlink_entity(layout, ent)  # 1. 从布局里摘掉
+        doc = getattr(ent, "doc", None)
+        if doc is not None:
+            doc.entitydb.discard(ent)  # 2. 从实体库删掉（不调 destroy）
+            ent.dxf.discard("handle")  # 3. 摘掉句柄 → 这个实体不再「活着」
+        if _gone(ent) or ent not in layout:
+            return True  # 已经从图里摘掉了（哪怕实体对象还带着 dxf 属性）
+    except Exception:
+        log.exception("remove entity fallback failed")
+    return _gone(ent)
+
+
+def _remove_insert_probe(doc, msp, probes, name: str) -> None:
+    """撤回这次新建的 INSERT（``probes``），以及（若没有任何引用了）为它导入的块定义。
+
+    只删 ``probes`` 里的实体，不碰调用方图里原有的同名插入；块定义只有在没有别的 INSERT
+    （任何布局 / 块定义里）引用时才删，不会删掉本来就在图里的定义。探测用的 INSERT 只加在
+    隔离副本里，``probes`` 一般是空的：这里只处理真的动过本图的情况。
+    """
+    probes = [p for p in (probes or []) if p is not None]
+    for probe in probes:
+        if _gone(probe):
+            continue
+        _remove_entity(msp, probe)
+    try:
+        if doc.blocks.get(name) is None:
+            return
+        for layout in [doc.modelspace(), *doc.blocks]:
+            for ent in layout.query("INSERT"):
+                if ent not in probes and str(ent.dxf.name) == name and not _gone(ent):
+                    return
+        doc.blocks.delete_block(name, safe=True)
+    except Exception:
+        log.exception("remove insert probe for %s failed", name)
+
+
+def _block_available(name: str) -> bool:
+    """库里能不能找到这个块（只查索引，不导入、不改文档）。"""
+    try:
+        index = library.get_index()
+    except Exception:
+        return False
+    for item in index.get("blocks") or []:
+        if item.get("name") == name:
+            return True
+    return False
+
+
+def _rollback_created(doc, msp, created: dict[str, Any]) -> None:
+    """旧图块没能删掉时，把刚插的新块撤掉，避免同一处出现两个符号。"""
+    handle = created.get("handle")
+    if not handle:
+        return
+    try:
+        ent = doc.entitydb.get(handle)
+    except Exception:
+        ent = None
+    if ent is None:
+        return
+    if _remove_entity(msp, ent):
+        return
+    log.error("rollback created insert failed")
 
 
 def _ensure_sortents(doc) -> None:
@@ -854,6 +1229,133 @@ def placement_issues(
         return []
 
 
+class PlanBlockedError(ValueError):
+    """方案（结构或保护图层）有阻断项：不写图、不建快照。``result`` 是 planschema 的结果。
+
+    main 用 ``result.needs_clarification`` 区分「问用户」与「提示被拦下」。
+    """
+
+    def __init__(self, message: str, result: Any):
+        super().__init__(message)
+        self.result = result
+        try:
+            self.codes = [str(i.get("code")) for i, _ in result.blockers]
+        except Exception:
+            self.codes = []
+
+
+def _plan_blocked(result: Any) -> PlanBlockedError:
+    """把 planschema 的结果包成异常；文案取前三条中文说明。"""
+    try:
+        issues = result.issue_dicts(kind="blockers")
+    except Exception:
+        issues = []
+    message = "方案没有执行：" + "；".join(
+        str(i.get("message") or i.get("code")) for i in issues[:3]
+    )
+    return PlanBlockedError(message, result)
+
+
+# 这些原因属于「不该动」：整条方案一项都没写上时，以结构化阻断报出（见 ``mutation_blocked``）。
+BLOCKING_RESULT_CODES = frozenset({"protected_layer", "nested_not_supported", "ambiguous_target", "hidden_not_supported"})
+
+
+def block_content_issues(doc, plan: dict[str, Any], *, bbox=None) -> list[dict[str, Any]]:
+    """整条方案的预检：删除 / 移动 / 替换的旧块是不是落在保护层，或块里有保护内容。
+
+    返回与逐项写图结果同形的失败项（``ok=False`` / ``reason`` / ``issue_code``），
+    交给 ``mutation_blocked`` 保住 ``protected_layer`` / ``nested_not_supported`` 这些原因码
+    和中文说明。只判明显的保护问题，没找到 / 歧义 / 坐标越界留给写图时逐项报告。
+    """
+    msp = doc.modelspace()
+    out: list[dict[str, Any]] = []
+    plan = plan or {}
+    specs = (
+        ("delete", "deletes", "block", ("xy", "from_xy", "from")),
+        ("move", "moves", "block", ("from", "from_xy")),
+        ("replace", "replaces", "from_block", ("from_xy", "from")),
+    )
+    for op, key, name_key, xy_keys in specs:
+        for idx, item in enumerate(plan.get(key) or []):
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get(name_key) or "").strip()
+            xy = next((_as_xy(item.get(k)) for k in xy_keys if _as_xy(item.get(k))), None)
+            if not name or not xy:
+                continue
+            located = _locate_target(doc, msp, name, xy, bbox)
+            if located.get("found"):
+                continue
+            code = str(located.get("issue_code") or "")
+            if code not in {"protected_layer", "nested_not_supported", "hidden_not_supported"}:
+                continue
+            out.append(
+                {
+                    "ok": False,
+                    "action": op,
+                    "block": name,
+                    "reason": str(located.get("reason") or "这一项落在保护内容上，不能改"),
+                    "issue_code": code,
+                    "index": idx,
+                    "xy": located.get("xy") or xy,
+                }
+            )
+    return out
+
+
+def mutation_blocked(results: list[dict[str, Any]]):
+    """逐项结果 → ``PlanResult``：只有「全部没写上、且原因都是保护 / 嵌套 / 歧义」才算阻断。"""
+    from . import planschema
+
+    blockers = []
+    for r in results:
+        code = str(r.get("issue_code") or "not_applied")
+        blockers.append(
+            (
+                planschema._issue(code, "error", str(r.get("reason") or "这一项没有写入"), "", None, r.get("block") or "", r.get("xy")),
+                -1,
+            )
+        )
+    return planschema.PlanResult(plan={}, blockers=blockers, needs_clarification=False, status="blocked")
+
+
+def all_blocking(results: list[dict[str, Any]]) -> bool:
+    """每一项都是失败、且失败原因都属于「不该动」（保护层 / 嵌套 / 歧义）。"""
+    return bool(results) and all(
+        (not r.get("ok")) and r.get("issue_code") in BLOCKING_RESULT_CODES for r in results
+    )
+
+
+def validate_for_apply(
+    plan: Any,
+    doc=None,
+    *,
+    bbox=None,
+    region: Optional[dict[str, Any]] = None,
+    index: Optional[dict[str, Any]] = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]], Any]:
+    """预览与正式写入共用的写图前校验：结构（planschema）+ 坐标（placement）。
+
+    返回 ``(归一化后的方案, issues, result)``。结构校验有阻断项就直接抛
+    ``PlanBlockedError``；给了 doc 时把坐标问题也并进 issues（只作提示/回喂模型，
+    写图时被拦下的项会各自失败）。调用方**不能**用「传空 issues」跳过校验：
+    ``apply_mutations`` 自己也会先跑一遍结构校验。
+    """
+    from . import planschema
+
+    result = planschema.normalize_plan(plan)
+    if not result.valid:
+        raise _plan_blocked(result)
+    issues = placement_issues(doc, result.plan, bbox=bbox, region=region, index=index) if doc is not None else []
+    if doc is not None:
+        # 坐标校验之后再整条过一次「目标是不是图框 / 图签 / 标题」：整条都落在保护内容上的
+        # 方案在建工作副本、出快照之前就拦下，不留任何文件。
+        blocked = block_content_issues(doc, result.plan, bbox=bbox)
+        if blocked:
+            raise _plan_blocked(mutation_blocked(blocked))
+    return result.plan, issues, result
+
+
 def _issue_codes(issues: Optional[list[dict[str, Any]]]) -> dict[tuple[str, int], str]:
     """(op, index) → 第一个 error 级 issue code，用于给失败项补充原因。"""
     out: dict[tuple[str, int], str] = {}
@@ -888,12 +1390,27 @@ def apply_mutations(
     index: Optional[dict[str, Any]] = None,
     issues: Optional[list[dict[str, Any]]] = None,
 ) -> list[dict[str, Any]]:
-    """Mutate an in-memory DXF document. Does not save, snapshot, or write history."""
+    """Mutate an in-memory DXF document. Does not save, snapshot, or write history.
+
+    直接调用也跑同一套结构校验（planschema）：有阻断项时抛 ``PlanBlockedError``，
+    坏条目不会进图；``issues`` 只影响失败项的 issue_code，传什么都不能绕过校验。
+    """
+    from . import planschema
+
+    check = planschema.normalize_plan(plan)
+    if not check.valid:
+        raise _plan_blocked(check)
+    # 同角色别名冲突的条目已从归一化结果里剔除（什么都不写）。但直接把原方案交给这里、
+    # 又没看 warnings 的调用方要能知道：有冲突就整体拒绝，而不是悄悄少做几项。
+    conflicts = [i for i, _ in check.warnings if i.get("code") == "alias_conflict"]
+    if conflicts:
+        raise _plan_blocked(planschema.PlanResult(plan={}, blockers=[(c, -1) for c in conflicts], needs_clarification=True, status="needs_clarification"))
+    plan = check.plan
+    if issues is None:
+        issues = placement_issues(doc, plan, bbox=bbox, region=region, index=index)
     msp = doc.modelspace()
     layer = _ensure_layer(doc, layer)
     results: list[dict[str, Any]] = []
-    if issues is None:
-        issues = placement_issues(doc, plan, bbox=bbox, region=region, index=index)
     codes = _issue_codes(issues)
 
     for idx, item in enumerate(plan.get("deletes") or []):
@@ -901,37 +1418,65 @@ def apply_mutations(
             "ok": False, "reason": "删除项格式不对", "item": item
         }
         results.append(_with_issue_code(result, codes, "delete", idx))
+    # 替换的顺序是「先插新的，成了再动旧的」：新块插不上（库里没有、坐标越界、block 名错）
+    # 时旧图块原样保留，绝不先删后失败、导致那一处什么都没了。
     for idx, item in enumerate(plan.get("replaces") or []):
         if not isinstance(item, dict):
             results.append({"ok": False, "reason": "替换项格式不对", "item": item})
             continue
-        # 旧块上的属性值要在删除之前抄下来：msp.delete_entity 会把实体销毁。
+        old_item = {
+            "block": item.get("from_block") or item.get("block"),
+            "xy": item.get("from_xy") or item.get("xy") or item.get("from"),
+        }
+        new_xy = _as_xy(item.get("xy") or item.get("to") or item.get("from_xy") or item.get("from"))
+        check = _preflight_replace(doc, msp, old_item, item, bbox, new_xy)
+        if not check.get("found"):
+            reason = str(check.get("reason") or "这里不能安全替换")
+            results.append(_with_issue_code({"ok": False, **check, "reason": reason}, codes, "replace", idx))
+            continue
+        found = check.get("found")
+        # 旧块的一切都要在动旧块之前取好：delete_entity 会把实体和它的属性一起销毁。
+        old_entity = found.get("entity")
+        old_layer = _layer_name(old_entity)
         carry = _attributes_to_carry(doc, msp, item, bbox)
-        d = _hide_or_delete(
-            doc,
-            msp,
-            {
-                "block": item.get("from_block") or item.get("block"),
-                "xy": item.get("from_xy") or item.get("xy") or item.get("from"),
-            },
-            bbox,
-            layer,
+        ins = dict(item)
+        ins.setdefault("xy", new_xy)
+        created = _add_insert(
+            doc, msp, ins, layer, bbox, found=found,
+            region=region, index=index, snap_kind="replace",
         )
-        results.append(_with_issue_code(d, codes, "replace", idx))
-        if d.get("ok"):
-            ins = dict(item)
-            ins.setdefault("xy", item.get("to") or item.get("xy") or (d.get("xy")))
-            created = _add_insert(
-                doc, msp, ins, layer, bbox, found=d.get("found"),
-                region=region, index=index, snap_kind="replace",
-            )
-            if created.get("ok") and carry:
-                ref = created.get("handle") and doc.entitydb.get(created["handle"])
-                old_layer = _layer_name((d.get("found") or {}).get("entity"))
+        if not created.get("ok"):
+            # 新块没插上：旧块一个都还没动，保留原样，只报失败。
+            results.append(_with_issue_code(
+                {**created, "reason": f"替换没有执行，原图块保留：{created.get('reason') or '新图块没有写上'}"},
+                codes, "replace", idx,
+            ))
+            continue
+        if found.get("kind") == "direct":
+            # 原位置本来就是普通顶层图块：就地删掉这一个，不做覆盖。
+            removed = _delete_direct(msp, found)
+        else:
+            removed = _hide_or_delete(doc, msp, old_item, bbox, layer)
+        if not removed.get("ok"):
+            _rollback_created(doc, msp, created)
+            results.append(_with_issue_code(
+                {**removed, "reason": f"替换没有完成，原图块没能删掉，新图块已撤回：{removed.get('reason') or ''}"},
+                codes, "replace", idx,
+            ))
+            continue
+        if carry:
+            ref = created.get("handle") and doc.entitydb.get(created["handle"])
+            try:
                 applied = _apply_carried_attribs(doc, ref, carry, old_layer)
-                if applied:
-                    created["attribs"] = applied
-            results.append(created)
+            except Exception:
+                # 属性没抄过去不是「替换没做成」：旧块已经删了，如实标出来，不让整条替换报失败。
+                log.exception("carry attribs failed for %s", created.get("block"))
+                applied = {}
+                created["attribs_failed"] = True
+            if applied:
+                created["attribs"] = applied
+        results.append(removed)
+        results.append(created)
     for idx, item in enumerate(plan.get("moves") or []):
         if not isinstance(item, dict):
             results.append({"ok": False, "reason": "移动项格式不对", "item": item})
@@ -944,30 +1489,52 @@ def apply_mutations(
                 {"ok": False, "reason": "移动需要块名、起点和终点", "item": item}, codes, "move", idx
             ))
             continue
-        found = find_symbol(doc, msp, name, src, bbox)
-        if not found or found["kind"] != "direct":
+        found = _locate_target(doc, msp, name, src, bbox)
+        if not found.get("found"):
             results.append(_with_issue_code(
-                {"ok": False, "reason": f"没有找到要移动的「{name}」", "block": name, "from": src},
+                {k: v for k, v in found.items() if k != "found"},
                 codes, "move", idx,
+            ))
+            continue
+        target = found["found"]
+        if target["kind"] != "direct":
+            results.append(_with_issue_code(
+                _nested_rejection(name, target), codes, "move", idx
             ))
             continue
         if not _in_region(dst, bbox):
             results.append(_with_issue_code(
-                {"ok": False, "reason": "目标坐标不在当前分区内", "block": name, "to": dst},
+                {"ok": False, "reason": "目标坐标不在当前分区内", "block": name, "to": dst, "issue_code": "out_of_region"},
                 codes, "move", idx,
             ))
             continue
-        ent = found["entity"]
+        ent = target["entity"]
+        # 写之前把取值都算出来：rot 是布尔/NaN/字符串时在动坐标之前就失败，不留「动了一半」。
         try:
-            ent.dxf.insert = (dst[0], dst[1], float(getattr(ent.dxf.insert, "z", 0) or 0))
-            if item.get("rot") is not None:
-                ent.dxf.rotation = float(item["rot"])
+            new_rot = _checked_rotation(item.get("rot"))
+        except Exception as exc:
+            results.append(_with_issue_code(
+                {"ok": False, "reason": f"移动没有执行：{exc}", "block": name, "from": src}, codes, "move", idx
+            ))
+            continue
+        try:
+            old_insert = tuple(ent.dxf.insert)
+            try:
+                ent.dxf.insert = (dst[0], dst[1], float(getattr(ent.dxf.insert, "z", 0) or 0))
+                if new_rot is not None:
+                    ent.dxf.rotation = new_rot
+            except Exception:
+                ent.dxf.insert = old_insert
+                raise
         except Exception as exc:
             results.append(_with_issue_code(
                 {"ok": False, "reason": f"移动失败：{exc}", "block": name}, codes, "move", idx
             ))
             continue
-        results.append({"ok": True, "action": "move", "block": name, "from": src, "to": dst})
+        moved = {"ok": True, "action": "move", "block": name, "from": src, "to": dst}
+        if new_rot is not None:
+            moved["rot"] = new_rot
+        results.append(moved)
     for idx, item in enumerate(plan.get("inserts") or []):
         if not isinstance(item, dict):
             results.append({"ok": False, "reason": "新增项格式不对", "item": item})
@@ -1043,8 +1610,7 @@ TEXT_EDIT_TEXT_TYPES = {"TEXT", "MTEXT"}
 
 
 def _text_edit_pool(msp) -> list[tuple[Any, Any]]:
-    """可改的文字：(实体, 写回目标的宿主)。模型空间的 TEXT/MTEXT 宿主是自己；
-    简单顶层 INSERT 上的 ATTRIB 宿主是这条 INSERT。"""
+    """可改的文字：(实体, 宿主)。宿主是 None（模型空间的 TEXT/MTEXT）或 (所属 INSERT, 矩阵)。"""
     pool: list[tuple[Any, Any]] = []
     for ent in msp:
         try:
@@ -1061,8 +1627,6 @@ def _text_edit_pool(msp) -> list[tuple[Any, Any]]:
             attribs = list(ent.attribs)
         except Exception:
             continue
-        if not attribs:
-            continue
         for attrib in attribs:
             pool.append((attrib, (ent, matrix)))
     return pool
@@ -1071,14 +1635,35 @@ def _text_edit_pool(msp) -> list[tuple[Any, Any]]:
 OUT_OF_SCOPE_REASON = "当前分区里没有找到原文字「{text}」（别处图幅上的同名文字不改）"
 
 
+def _matched_layer_protected(ent, host) -> Optional[str]:
+    """改这条文字会落到保护图层上时返回这个图层名（显示图层，含 layer 0 继承），否则 None。
+
+    host 是块内文字的 (宿主 INSERT, 矩阵)。宿主块里有保护内容（图框、图签）
+    时，块里的字就是那些内容的一部分，同样不改。
+    """
+    from . import planschema
+
+    names = [planschema.effective_layer(ent)]
+    if host is not None:
+        names.append(planschema.effective_layer(host[0]))
+        where = planschema.analyze_insert(host[0]).get("protected_where")
+        if where:
+            names.append(str(where))
+    for name in names:
+        if planschema.is_protected_layer(name):
+            return name
+    return None
+
+
 def _find_text_to_edit(msp, from_text: str, xy, bbox=None) -> dict[str, Any]:
     """在当前分区里按可见文字精确匹配（只规整空白），标点算数；失败再按全/半角放宽一次。
 
     - 范围：命中点必须落在 bbox（当前分区，``_in_region`` 同样的外扩）内；bbox 为空
       表示整张图。只有别的分区里有匹配 → 明确说「当前分区里没有找到」。
     - 精确匹配：多处取离 xy 最近的一处；一样近就是歧义，绝不猜。
-    - 放宽（忽略全/半角与空白）：只在**恰好一处**时采用，标 width-normalized；
-      两处以上一律报歧义，不按距离挑。
+    - 放宽（忽略全/半角与空白）：放宽口径命中的每一处，只要和另一处**精确**命中相距
+      < AMBIGUITY_MM，就说明「差一个全/半角」分不清该改哪一处 → 报歧义，不按距离挑；
+      否则只在放宽口径**恰好一处**时采用，标 width-normalized。
     - 子串、去标点、近似字一律不算。
     """
     from . import dxftext
@@ -1138,6 +1723,10 @@ def _find_text_to_edit(msp, from_text: str, xy, bbox=None) -> dict[str, Any]:
         unique = _dedupe(wide)
         if len(unique) > 1:
             return ambiguous
+        wide_dist = unique[0][0]
+        for other in _dedupe(exact):
+            if abs(other[0] - wide_dist) < AMBIGUITY_MM:
+                return ambiguous
         dist, ent, host, visible, point = unique[0]
         return {
             "ok": True,
@@ -1154,9 +1743,9 @@ def _find_text_to_edit(msp, from_text: str, xy, bbox=None) -> dict[str, Any]:
 
 
 def _resolve(hits: list[tuple], ambiguous: dict[str, Any]) -> dict[str, Any]:
-    """精确匹配的多处候选：取最近的；一样近（<1mm）就是歧义。"""
+    """精确匹配的多处候选：取最近的；一样近（差 < AMBIGUITY_MM）就是歧义。"""
     hits = sorted(hits, key=lambda h: h[0])
-    if len(hits) >= 2 and abs(hits[1][0] - hits[0][0]) < 1.0:
+    if len(hits) >= 2 and abs(hits[1][0] - hits[0][0]) < AMBIGUITY_MM:
         return ambiguous
     dist, ent, host, visible, point = hits[0]
     return {"ok": True, "entity": ent, "host": host, "from": visible, "hit_xy": point, "dist": dist}
@@ -1218,13 +1807,24 @@ def _edit_text(doc, msp, item: dict[str, Any], bbox, layer: str) -> dict[str, An
         return {"ok": False, "reason": "改文字缺少新文字（text）", "item": item}
     if not xy:
         return {"ok": False, "reason": "改文字缺少坐标（xy）", "item": item}
+    if not _in_region(xy, bbox):
+        return {"ok": False, "reason": "改文字的坐标不在当前分区内", "from_text": from_text, "xy": xy}
     found = _find_text_to_edit(msp, from_text, xy, bbox)
     if not found.get("ok"):
         return found
     ent = found["entity"]
     host = found["host"]
-    if not _in_region(xy, bbox):
-        return {"ok": False, "reason": "改文字的坐标不在当前分区内", "from_text": from_text, "xy": xy}
+    protected_layer = _matched_layer_protected(ent, host)
+    if protected_layer:
+        # 图框、图签、标题上的字（含块定义继承来的图层）一律不改。
+        return {
+            "ok": False,
+            "reason": f"原文字「{found.get('from') or from_text}」在保护图层「{protected_layer}」上，图框、图签、标题的文字不改",
+            "from_text": from_text,
+            "xy": found.get("hit_xy") or xy,
+            "handle": _handle_of(ent),
+            "issue_code": "protected_layer",
+        }
     handle = _handle_of(ent)
     layer_before = _layer_name(ent)
     try:
@@ -1345,6 +1945,10 @@ def apply_plan(
     if not plan or not isinstance(plan, dict):
         raise ValueError("没有可写入的方案。")
     bbox = (region or {}).get("bbox")
+    encoding = proj.get("encoding") or "utf-8"
+    # 先在当前图上跑一遍（只读）：目标在保护层/共享块里这类问题在写任何文件之前就拦下。
+    source_doc = _read_doc(current_dxf(proj), encoding)
+    plan, issues, _result = validate_for_apply(plan, source_doc, bbox=bbox, region=region)
     dest = ensure_work_copy(proj)
     official = official_dxf(proj)
     hist = load_history(proj)
@@ -1353,10 +1957,9 @@ def apply_plan(
     snap = _snapshot_path(proj, next_rev)
     _write_snapshot(dest, snap)
 
-    encoding = proj.get("encoding") or "utf-8"
+    # 与预览同一条路径（同一函数读文件），在快照后、保存前写内存副本。
     doc = _read_doc(dest, encoding)
     layer = _ensure_layer(doc, f"{NEW_LAYER_PREFIX}-{next_rev}")
-    issues = placement_issues(doc, plan, bbox=bbox, region=region)
     results = apply_mutations(doc, plan, bbox=bbox, layer=layer, region=region, issues=issues)
     snapped_count = sum(1 for r in results if r.get("snapped"))
 
@@ -1365,7 +1968,15 @@ def apply_plan(
     if ok_n == 0:
         if snap.is_file():
             snap.unlink()
+        if next_rev == 1 and not hist["entries"]:
+            # 还没写过任何一步：这次没改成功就不该留下工作副本。
+            try:
+                work_path(proj).unlink(missing_ok=True)
+            except OSError:
+                log.exception("remove work copy after failed first apply")
         reasons = [r.get("reason") for r in results if r.get("reason")]
+        if all_blocking(results):
+            raise _plan_blocked(mutation_blocked(results))
         raise ValueError(reasons[0] if reasons else "方案里没有能写进工作图的改动。")
 
     old_base = None
@@ -1636,11 +2247,16 @@ def _preview_doc(proj: dict[str, Any], plan: dict[str, Any], region: dict[str, A
     next_rev = next_revision_number(proj)
     layer = _ensure_layer(doc, f"{NEW_LAYER_PREFIX}-{next_rev}")
     bbox = (region or {}).get("bbox")
-    # 预览与正式写入走同一套吸附，所见即所得。
+    # 结构与坐标校验在这里先跑一遍（与 apply_plan 同一函数）：被拦下的方案预览直接失败，
+    # 不画一张「看起来没问题」的图。之后预览与正式写入走同一套吸附/保护判断，所见即所得。
+    plan, _issues, _result = validate_for_apply(plan, doc, bbox=bbox, region=region)
     results = apply_mutations(doc, plan, bbox=bbox, layer=layer, region=region)
     ok_n = sum(1 for r in results if r.get("ok"))
     if ok_n == 0:
         reasons = [r.get("reason") for r in results if r.get("reason")]
+        # 目标落在保护层 / 共享块里：和 apply_plan 一样给出结构化阻断（只含这类原因时）。
+        if all_blocking(results):
+            raise _plan_blocked(mutation_blocked(results))
         raise ValueError(reasons[0] if reasons else "方案里没有能预览的改动。")
     return doc, results, ok_n, src, encoding, bbox
 
@@ -1664,6 +2280,8 @@ def render_plan_preview(
     from . import cad_render
 
     dest = Path(dest)
+    # _preview_doc 里先跑与 apply_plan 相同的校验：阻断项抛 PlanBlockedError，连预览文件都不建。
+    plan, _issues, _result = validate_for_apply(plan)
     dest.parent.mkdir(parents=True, exist_ok=True)
     doc, results, ok_n, src, encoding, bbox = _preview_doc(proj, plan, region)
     view = list(bbox) if bbox and len(bbox) == 4 else []

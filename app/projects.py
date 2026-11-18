@@ -547,7 +547,7 @@ def _equipment_lines(room: dict[str, Any], *, full: bool) -> list[str]:
                 if e.get("host_block"):
                     bit += f"  所在底图块={e.get('host_block')}"
                 if e.get("edit_hint") == "overlay":
-                    bit += "  改法=在模型空间覆盖，勿改底图块定义"
+                    bit += "  改法=不支持（嵌套在共享底图块里，不能删改）"
                 if e.get("attribs"):
                     bit += f"  属性={e.get('attribs')}"
                 lines.append(bit)

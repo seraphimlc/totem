@@ -924,7 +924,9 @@ def apply_plan_to_doc(proj: dict[str, Any], plan: dict[str, Any], region: dict[s
     next_rev = apply.next_revision_number(proj)
     layer = f"{apply.NEW_LAYER_PREFIX}-{next_rev}"
     bbox = (region or {}).get("bbox")
-    results = apply.apply_mutations(doc, plan, bbox=bbox, layer=layer)
+    # 与 apply_plan / render_plan_preview 同一套写图前校验；被拦下时抛 PlanBlockedError。
+    plan, issues, _result = apply.validate_for_apply(plan, doc, bbox=bbox, region=region)
+    results = apply.apply_mutations(doc, plan, bbox=bbox, layer=layer, issues=issues)
     ok_n = sum(1 for r in results if r.get("ok"))
     if ok_n == 0:
         reasons = [r.get("reason") for r in results if r.get("reason")]

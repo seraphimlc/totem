@@ -1394,7 +1394,7 @@ def format_equipment_line(rec: dict[str, Any]) -> str:
     if rec.get("host_block"):
         line += f"  所在底图块=`{rec['host_block']}`"
     if rec.get("edit_hint") == "overlay":
-        line += "  改法=在模型空间覆盖，勿改底图块定义"
+        line += "  改法=不支持（嵌套在共享底图块里，不能删改）"
     return line
 
 

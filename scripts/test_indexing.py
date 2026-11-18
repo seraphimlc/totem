@@ -103,7 +103,8 @@ def test_flatten_and_excerpt() -> None:
     _ok("excerpt-has-official-name", "做成ACAD TuKuai0155" in excerpt)
     count_xy = excerpt.count("坐标=")
     _ok("excerpt-lists-instances", count_xy >= 8, f"coord lines={count_xy}\n{excerpt}")
-    _ok("excerpt-tells-overlay", "勿改底图块定义" in excerpt or "覆盖" in excerpt)
+    # Phase 3：嵌套在共享底图块里的符号不支持删改，摘录如实说明，不再教模型「在模型空间覆盖」。
+    _ok("excerpt-tells-nested-unsupported", "不支持" in excerpt and "改法=在模型空间覆盖" not in excerpt, excerpt[:600])
 
 
 def test_library_search_seated() -> None:

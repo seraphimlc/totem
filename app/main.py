@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import apply, archive_queue, auth, cad_render, config, convert, decision, init_proj, library, maas, placement, projects, scene
+from . import apply, archive_queue, auth, cad_render, config, convert, decision, init_proj, library, maas, placement, planschema, projects, scene
 from .prompts import (
     SYSTEM_PROMPT,
     build_history_messages,
@@ -361,15 +361,47 @@ async def _offload(fn, *args, **kwargs):
     return await asyncio.to_thread(fn, *args, **kwargs)
 
 
-def _check_plan_coords(proj: dict[str, Any], plan: dict[str, Any], region_info: dict[str, Any]):
-    """在内存工作图上跑坐标校验。只读 DXF，不写盘、不出快照。"""
+def _normalized_edits(plan: Any) -> Optional[planschema.PlanResult]:
+    """归一化方案；返回 None 表示「不是改图方案」（answer / critique / reject 等），原样处理。"""
+    if not is_edit_plan(plan):
+        return None
+    return planschema.normalize_plan(plan)
+
+
+def _sentence_sep(text: str) -> str:
+    """reply 末句还没收尾时补一个中文句号，避免与提示粘成一句。"""
+    last = (text or "").rstrip()[-1:]
+    return "" if last in "。！？；：!?;:.…" else "。"
+
+
+def _clarify_reply(result: planschema.PlanResult) -> str:
+    msg = planschema.clarify_message(result).strip()
+    return msg or "这个改图要求还没说清楚，请补充要改的位置或对象后再试。"
+
+
+def _check_plan_coords(
+    proj: dict[str, Any],
+    plan: dict[str, Any],
+    region_info: dict[str, Any],
+    schema: Optional[planschema.PlanResult] = None,
+):
+    """在内存工作图上跑坐标校验。只读 DXF，不写盘、不出快照。
+
+    先把方案重新归一化一遍（结构校验），再按归一化后的版本查坐标：修复轮里模型重新给的
+    ``plan`` 没经过结构校验，这一步保证坐标校的是真正会写进图的那一版。
+    """
+    if schema is None:
+        schema = planschema.normalize_plan(plan)
+    if not schema.valid:
+        return schema, []
     doc = apply._read_doc(Path(apply.current_dxf(proj)), proj.get("encoding") or "utf-8")
-    return placement.check_plan(
+    issues = placement.check_plan(
         doc,
-        plan,
+        schema.plan,
         bbox=(region_info or {}).get("bbox"),
         region=region_info,
     )
+    return schema, issues
 
 
 def _error_issues(issues) -> list[dict[str, Any]]:
@@ -671,19 +703,34 @@ async def api_chat(project_id: str, body: ChatBody, user: str = Depends(_user)):
             edit_plan = is_edit_plan(plan)
             corrected = 0
             issues: list[dict[str, Any]] = []
+            schema_result: Optional[planschema.PlanResult] = None
+            clarify_text = ""
+
+            # 先做结构校验（planschema），再进坐标修复循环：结构本身有阻断项时，回喂模型
+            # 修坐标只会浪费一次往返，直接问用户；未知字段只提示、不拦。
+            if edit_plan and isinstance(plan, dict):
+                schema_result = await _offload(_normalized_edits, plan)
+                if schema_result is not None and not schema_result.valid:
+                    edit_plan = False
+                    clarify_text = _clarify_reply(schema_result)
+                elif schema_result is not None:
+                    plan = schema_result.plan
 
             # 方案出完先按图面几何校一遍坐标；有 error 就回喂模型只修坐标，
             # 中间结果不推给前端，最多修 MAX_PLAN_REPAIRS 轮，出错就用原方案。
             if edit_plan and plan_has_edits(plan):
                 try:
-                    async for item in _await_with_heartbeats(_check_plan_coords, proj, plan, region_info):
+                    async for item in _await_with_heartbeats(_check_plan_coords, proj, plan, region_info, schema_result):
                         if isinstance(item, (bytes, bytearray)):
                             yield item
                         else:
-                            issues = item
+                            schema_result, issues = item
                 except Exception:
                     log.exception("plan coordinate check failed")
                     issues = []
+                if schema_result is not None and schema_result.valid:
+                    # 坐标校验按归一化后的方案查；落进图里的也必须是同一版（未知键已剔除等）。
+                    plan = schema_result.plan
                 errors = _error_issues(issues)
                 repairs = 0
                 while errors and repairs < MAX_PLAN_REPAIRS:
@@ -706,11 +753,19 @@ async def api_chat(project_id: str, body: ChatBody, user: str = Depends(_user)):
                         candidate = maas.extract_assistant_payload(repaired_raw)
                         if not (candidate and is_edit_plan(candidate)):
                             break
-                        candidate_issues = await _offload(_check_plan_coords, proj, candidate, region_info)
-                        if len(_error_issues(candidate_issues)) >= len(errors):
+                        # 修复轮回来的方案同样先过结构校验：结构坏了、或整条都落在图框/图签
+                        # 这类保护内容上，就整条丢掉、保留原来那一版（不猜、不部分采纳）。
+                        candidate_schema = await _offload(planschema.normalize_plan, candidate)
+                        if not candidate_schema.valid or not plan_has_edits(candidate_schema.plan):
                             break
-                        corrected = _xy_changes(plan, candidate)
-                        plan = candidate
+                        candidate_schema, candidate_issues = await _offload(
+                            _check_plan_coords, proj, candidate_schema.plan, region_info, candidate_schema
+                        )
+                        if not candidate_schema.valid or len(_error_issues(candidate_issues)) >= len(errors):
+                            break
+                        corrected = _xy_changes(plan, candidate_schema.plan)
+                        plan = candidate_schema.plan
+                        schema_result = candidate_schema
                         raw_text = repaired_raw
                         edit_plan = True
                         issues = candidate_issues
@@ -721,12 +776,22 @@ async def api_chat(project_id: str, body: ChatBody, user: str = Depends(_user)):
                         log.exception("plan coordinate repair failed, keep original plan")
                         break
             if edit_plan and isinstance(plan, dict):
-                plan["issues"] = issues
+                all_issues = list(issues)
+                if schema_result is not None:
+                    all_issues = schema_result.issue_dicts(kind="warnings") + all_issues
+                    plan["schema"] = schema_result.to_dict()
+                plan["issues"] = all_issues
 
             reply = reply_text(plan, raw_text) or "这次没有给出完整回答，请换一种说法再试，或换一个模型。"
-            hint = _geometry_hint(corrected, issues)
-            if hint and edit_plan:
-                reply = f"{reply}{hint}"
+            if clarify_text:
+                reply = clarify_text
+            text_hint = ""
+            if edit_plan:
+                text_hint = _geometry_hint(corrected, issues)
+                if schema_result is not None and schema_result.warnings:
+                    text_hint += planschema.warning_message(schema_result)
+            if text_hint:
+                reply = f"{reply.rstrip()}{_sentence_sep(reply)}{text_hint}"
             assistant = {
                 "id": assistant_id,
                 "role": "assistant",
@@ -734,8 +799,9 @@ async def api_chat(project_id: str, body: ChatBody, user: str = Depends(_user)):
                 "ts": projects.now_iso(),
                 "model": model,
                 "region": region_info["id"],
-                "mode": (plan.get("mode") if plan else None) or ("plan" if edit_plan else "answer"),
-                "plan": plan,
+                "mode": "clarify" if clarify_text else ((plan.get("mode") if plan else None) or ("plan" if edit_plan else "answer")),
+                # 结构被拦下时不保留半截方案：不渲染预览、不能确认应用。
+                "plan": None if clarify_text else plan,
                 "overlay": None,
                 "raw": raw_text if plan else None,
                 "used_image": used_image,
@@ -828,7 +894,10 @@ class ApplyBody(BaseModel):
 
 def _handle_intent(proj, intent: str, user_msg: dict[str, Any], assistant_id: str, region_info: dict[str, Any]):
     if intent == "apply":
-        result = _do_apply(proj, message_id=None, region=region_info)
+        try:
+            result = _do_apply(proj, message_id=None, region=region_info)
+        except apply.PlanBlockedError as exc:
+            raise ValueError(_blocked_detail(exc))
         text = (
             f"已把方案写到当前图纸新图层「{result.get('layer')}」。"
             f"成功 {result.get('ok_count')} 处"
@@ -856,6 +925,16 @@ def _handle_intent(proj, intent: str, user_msg: dict[str, Any], assistant_id: st
         "apply": result,
     }
     return result, assistant
+
+
+def _blocked_detail(exc: "apply.PlanBlockedError") -> str:
+    """被拦下的方案：给用户看中文原因；需要澄清的说清楚要补什么。"""
+    result = getattr(exc, "result", None)
+    if result is not None and getattr(result, "needs_clarification", False):
+        msg = planschema.clarify_message(result).strip()
+        if msg:
+            return msg
+    return str(exc)
 
 
 def _do_apply(proj: dict[str, Any], *, message_id: Optional[str], region: Optional[dict[str, Any]]):
@@ -919,6 +998,8 @@ def api_apply(project_id: str, body: ApplyBody, user: str = Depends(_user)):
         result = _do_apply(proj, message_id=body.message_id, region=region)
     except KeyError:
         raise HTTPException(status_code=404, detail="没有这个图幅或分区。")
+    except apply.PlanBlockedError as exc:
+        raise HTTPException(status_code=400, detail=_blocked_detail(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception:

@@ -130,7 +130,7 @@
 |---|---|---|---|---|---|---|
 | **1** | **DWG→DXF 转换抽象 + README 校正** | 新包 `app/convert/`；`init_proj.convert_dwg()` 变为薄包装；README/.env.example 更正 | 否 | 否（测试 mock/跳过） | 低 | 是（恢复 `convert_dwg` 函数体） |
 | 2 | 转换可观测性与上传前预检 | `/api/health` 增加转换器状态；`convert` 结果记入 `init.json`；上传错误文案分流 | 否 | 否 | 低 | 是 |
-| 3 | 方案结构校验（`app/planschema.py`） | 归一化 + blockers/warnings + 保护图层；接入 `_check_plan_coords` 之前 | 否（自造 DXF） | 否 | 中 | 是 |
+| 3 | 方案结构校验（`app/planschema.py`） | 归一化 + blockers/warnings/needs_clarification + 保护图层 + 替换不丢数据；接入 `_check_plan_coords` 之前；**已完成（未提交）** | 否（自造 DXF） | 否 | 中 | 是 |
 | 4 | 预览/应用结果与版本写入收口 | before/after + destructive；`atomicio`；文案修正 | 否 | 否 | 低 | 是 |
 | 5 | 合规式检查骨架（可选） | `app/compliance.py`，先做 1–2 条通用规则 | 部分 | 否 | 中 | 是 |
 | 6 | 本地部署补充说明 | macOS 字体候选、**本地**可选 Dockerfile、`deploy/` 不动 | 否 | 否 | 低 | 是 |
@@ -340,10 +340,33 @@ Phase 1 的自有实现：
 
 ### Phase 3：方案结构校验 `app/planschema.py`
 
-- 输入：`maas.extract_assistant_payload()` 的 dict；输出：归一化后的 dict + `issues`（**复用** `placement._issue()` 的键）。
-- 规则：未知键丢弃并 warning；坐标强制成 `[float, float]`；`rot` 范围 0–360；`scale` 必须为正；`block` 非空；`mode` 枚举；**保护图层**：`layer` 属于 `标题/图框/TITLE/BORDER/SEAL` 之一的插入一律 blocker（参考 `plan_validator.py` 的 protected_layers，但图腾的图层名以中文为主）。
-- 接入点：`app/main.py` 的 `_check_plan_coords()` 之前先跑归一化；归一化失败不问模型，直接把 `needs_clarification` 的 reply 给用户（顺带减少一次无效的修复往返）。
-- 测试：`scripts/test_planschema.py`，全部用字面量 dict，不需要 DXF。
+**状态：已完成（未提交，分支 `feat/windows-support`，基于 `449532f`）。**
+
+- 输入：`maas.extract_assistant_payload()` 的 dict；输出 `PlanResult`：归一化后的 `plan` + `blockers` + `warnings` + `needs_clarification` + `status`（`valid` / `valid_with_warnings` / `blocked` / `needs_clarification`）。issue 复用 `placement._issue()` 的键：`{"code","severity","message","op","index","block","xy"}`，severity 只有 `error`（blocker）/ `warn`（warning）。
+- 规则（`app/planschema.py`）：
+  - 未知键（方案顶层、条目内）丢弃并 warning（不再拦截）；`xy` 与 `to` 同时给且不一致时按 `xy`，warning。
+  - 坐标必须正好 `[x, y]` 两个有限实数：布尔、`NaN`/`Infinity`、字符串、三元组、对象、超过 1e9 都是 blocker；`rot` 不能是字符串/布尔/NaN（可超出 0–360，写入端仍取模）；`scale` 必须为正；`block` 非空；`mode` 只能是 `answer/critique/plan/reject`；`const_width`/`height` 不能为负。
+  - 坏条目会从归一化后的数组里剔除并记 blocker；即使调用方不看 blockers，也写不进坏条目。
+  - `needs_clarification`：整份方案不是对象、`plan` 模式却没有改动、删除只给块名没给位置（图上有同名块时无法确定删哪一处）。这些情况提示词没有规定会自动补坐标，所以直接问用户而不是回喂模型。
+  - **保护图层**：`图框/图签/标题/TITLE/BORDER/SEAL`（不区分大小写的子串匹配）。条目自己指名保护层 → blocker；目标 INSERT 的**实际**图层（含嵌套 insert 的图层继承、layer 0 继承）、块内文字、嵌套插入、以及 **INSERT 自带的 ATTRIB** 落在保护层 → 写入时拦下（父块的删/移/换整块不动）。
+  - **layer 0 继承只走 INSERT 链**：0 层实体显示在引用它的 INSERT 的图层上，逐层沿插入链上溯；块记录 / BLOCK 头的图层不参与继承。模型空间里自己画在 **0 层**的 INSERT 是合法的显示图层，照常可删/移/换；只有块缺失、xref、成环、嵌套过深、内容读不了、镜像插入才按「判不清」保护。
+  - 合法旧方案原样兼容：值不变、不产生 warning（有回归测试逐字段比对）。
+- 接入点：
+  - `app/main.py` 的 chat 在**坐标修复循环之前**先归一化；有 blocker 时**不再**回喂模型修坐标，直接把 `needs_clarification` 的中文说明作为 reply，并把消息标成 `mode=clarify`、`plan=None`；
+  - 方案写入图面时附带 `plan["schema"]`（status 与 issues）；warning 同时并入 `plan["issues"]` 并在 reply 末尾加一句「只作提醒」。
+  - `apply.apply_plan()` / `apply.render_plan_preview()` / `scene.preview_plan_scene()` / `apply.apply_mutations()` **共用** `apply.validate_for_apply()`：结构（planschema）+ 坐标（placement）。`apply_mutations` 自己也会跑结构校验，调用方传 `issues=[]` 也绕不过去；被拦下时抛 `apply.PlanBlockedError`（`ValueError` 子类，带 `result`/`codes`）。`apply_plan` 在**建工作副本/快照之前**先用只读方式校验一遍，保护层/共享块目标不会留下任何文件。
+  - 写图前的整条预检（`apply.block_content_issues` → `mutation_blocked`）保留真实的 `protected_layer` / `nested_not_supported` 原因码与中文说明（不再退化成 `not_applied`「这一项没有写入」）。
+  - 新块 / 库块一律先在隔离副本里试插并通过 `_guard_new_block`，通过后才往本图导入并插入；守卫失败或插入失败时本图原样（不残留试插实体，也不删掉原有的块定义）。
+  - `apply_mutations()` 的替换改为「先插新块，再删/覆盖旧块」：新块插不上时旧块原样保留；旧块没被隐藏成功时把新块撤回。嵌套在共享块里的目标一律不改（`nested_not_supported`），不再用覆盖假装已替换。
+  - 歧义：同名块、第二个候选与最近候选差 < 300mm（`apply.AMBIGUITY_MM`）→ `ambiguous_target`，不猜；改文字从「相差 < 1mm 才算歧义」统一为同一阈值，并在「精确」与「全/半角放宽」两种口径指向不同实体时判歧义。
+  - `text_edits` 的目标（含 block 继承来的实际图层）在保护层上 → 不改。移动前先校验坐标与旋转角。
+- 测试：`scripts/test_phase3.py`（全部自造 DXF，走真实入口：`apply_plan`、`render_plan_preview`、`apply_mutations`、`/chat`、`/apply`）。原计划里的 `scripts/test_planschema.py` 合并进了这个文件，因为一半用例需要 DXF 才能验证实际图层与预览/应用一致。
+- **不支持（如实拒绝或报失败，不声称已改）**：
+  - 共享图块内部的符号：不改块定义，模型空间也无法可靠盖住共享块图元，一律拒绝（`nested_not_supported`）；摘录里对应的提示是「改法=不支持」，提示词也不再教模型在模型空间覆盖；
+  - 图块内部的文字：`text_edits` 只改模型空间 TEXT/MTEXT 与顶层 INSERT 的属性；
+  - ATTRIB 的 0 层继承按「所属 INSERT」算，不按 ezdxf `RenderContext.resolve_layer(ATTRIB)` 的口径（后者不解析 ATTRIB 的 FROM/ATTDEF 链）；
+  - 不做任何合规/规范规则。
+- 与原计划的偏差：保护图层除了看计划里的 `layer` 字段，还按目标实体的实际图层（含嵌套/定义继承）判断，这是本阶段的主要新增；`needs_clarification` 的触发条件收窄到「说不清改哪个」这一类（方案不是对象、plan 模式无改动、删除缺位置），其余结构问题按 blocker 处理并给中文说明。
 
 ### Phase 4：预览/应用结果与版本写入收口
 
@@ -456,7 +479,7 @@ Phase 1 的自有实现：
 
 `README.md`、`DESIGN.md`、`.env.example`、`requirements.txt`、`app/config.py`、`app/main.py`、`app/init_proj.py`、`app/apply.py`、`app/placement.py`、`app/prompts.py`、`app/maas.py`、`app/projects.py`、`app/atomicio.py`、`app/filelock.py`、`app/archive_queue.py`、`app/library.py`、`app/cad_render.py`、`app/known.py`、`deploy/cad-studio.service`、`deploy/nginx-cad.visitworld.me.conf`、`deploy/pack.sh`、`deploy/rsync-exclude`、`scripts/test_placement.py`、`scripts/test_preview_sanitize.py`、`scripts/test_index_sqlite.py`、`scripts/test_apply_preview.py`、`scripts/run-dev.ps1`、`scripts/setup-venv.ps1`、`known-indexes/wanshangcheng/INDEX.md`、`known-indexes/xueshengshitang/INDEX.md`。
 
-规划中的新路径（**尚不存在**，由 Phase 1 创建）：`app/convert/__init__.py`、`app/convert/base.py`、`app/convert/dwg2dxf.py`、`app/convert/oda.py`、`scripts/test_convert.py`；Phase 3：`app/planschema.py`、`scripts/test_planschema.py`。
+已创建的路径：`app/convert/__init__.py`、`app/convert/base.py`、`app/convert/dwg2dxf.py`、`app/convert/oda.py`、`scripts/test_convert.py`（Phase 1）；`app/planschema.py`、`scripts/test_phase3.py`（Phase 3，原计划的 `scripts/test_planschema.py` 并入后者）。
 
 本文件引用到的 cad-ai-agent 路径：
 

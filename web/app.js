@@ -1141,7 +1141,9 @@
                         ? "已写入当前图纸，可以撤回。"
                         : ev.message.mode === "undo"
                           ? "已撤回上一步。"
-                          : ev.message.text
+                          : ev.message.mode === "clarify"
+                            ? "这个改图要求还没执行：请看上面需要你补充的位置或说明。"
+                            : ev.message.text
                             ? "已按当前图纸回答。"
                             : "这次没有给出完整回答，请换一种说法再试。";
               try {

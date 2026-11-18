@@ -138,15 +138,31 @@ def _make_nested_drawing(path: Path) -> dict:
     seat.add_lwpolyline([(-40, -300), (40, -300), (40, 0), (-40, 0)], close=True)
     host = doc.blocks.new("HOST")
     host.add_lwpolyline([(-400, -400), (400, -400), (400, 400), (-400, 400)], close=True)
+    # Phase 3：共享图块内部的符号一律不改（覆盖也无法可靠盖住共享块图元，块定义更不能改）。
+    # 这个蹲便仍然保留在 HOST 里，用来验证「计划点什么，块定义都原样不动」。
     host.add_blockref("SQUAT", insert=(100, 80), dxfattribs={"rotation": 180, "layer": "FF-FIXT"})
+    # 一个普通共享块：被两处插入，用来验证「嵌套目标被如实拒绝」
+    plain = doc.blocks.new("PLAIN_HOST")
+    # PLAIN_HOST 里一个「保护层」符号：只要目标是它，就必须拒绝，而且绝不能退化成
+    # 「覆盖共享块」或去改块定义。
+    plain.add_lwpolyline([(-400, -400), (400, -400), (400, 400), (-400, 400)], close=True)
+    plain.add_blockref("SEAT", insert=(0, 0), dxfattribs={"layer": "图框"})
+    plain.add_text("共享注记", dxfattribs={"height": 50, "insert": (0, -300)})
     msp = doc.modelspace()
     msp.add_blockref("HOST", insert=(10000, 20000), dxfattribs={"layer": "TWT_DIM"})
     msp.add_blockref("HOST", insert=(80000, 80000), dxfattribs={"layer": "TWT_DIM"})
+    msp.add_blockref("PLAIN_HOST", insert=(10000, 10000), dxfattribs={"layer": "TWT_DIM"})
+    msp.add_blockref("PLAIN_HOST", insert=(10200, 10200), dxfattribs={"layer": "0"})
     msp.add_blockref("SQUAT", insert=(500, 600), dxfattribs={"rotation": 0, "layer": "FF-FIXT"})
     doc.saveas(str(path))
     # world pos of nested squat in first host: 10000+100, 20000+80 = 10100, 20080
     return {
         "nested_xy": [10100.0, 20080.0],
+        "shared_xy": [10000.0, 10000.0],
+        "layer0_xy": [10200.0, 10200.0],
+        # 共享块符号只在本视图的检查框里：模型空间宿主 PLAIN_HOST 在 (10000, 10000)，
+        # 嵌套 squat 的定位框必须圈住宿主本身。
+        "shared_bbox": [9500.0, 9500.0, 15000.0, 15000.0],
         "other_host": [80000.0, 80000.0],
         "direct_xy": [500.0, 600.0],
         "bbox": [9000.0, 19000.0, 12000.0, 22000.0],
@@ -180,57 +196,54 @@ def test_overlay_replace_and_undo() -> None:
             ],
         }
 
-        # Preview must not write files or create a revision.
-        dest_png = root / "preview.png"
-        preview = apply.render_plan_preview(proj, plan, region, dest_png)
-        _ok("preview-png", dest_png.is_file() and dest_png.stat().st_size > 0, str(dest_png.stat().st_size))
-        _ok("preview-no-revision", apply.load_history(proj)["entries"] == [])
-        _ok("preview-no-work", not apply.is_dirty(proj))
-        _ok("preview-source-untouched", _sha(src) == before)
-        _ok("preview-status-no-undo", apply.status(proj)["can_undo"] is False)
+        # Phase 3：共享块里的蹲便不能「声称已替换」。预览/应用都如实报不支持，什么都不写。
+        shared_plan = {
+            "mode": "plan",
+            "reply": "已替换一处蹲便。",
+            "replaces": [
+                {
+                    "from_block": "SEAT",
+                    "from_xy": info["shared_xy"],
+                    "block": "SQUAT",
+                    "xy": info["shared_xy"],
+                    "rot": 90,
+                    "layer": "FU-TECH-卫浴",
+                }
+            ],
+        }
+        shared_region = {"id": "subview:test:shared", "bbox": info["shared_bbox"]}
+        try:
+            apply.render_plan_preview(proj, shared_plan, shared_region, root / "shared.png")
+        except apply.PlanBlockedError as exc:
+            # 预检如实报「嵌套在共享块里」（nested_not_supported），不能是笼统的 not_applied。
+            _ok("nested-preview-blocked", "nested_not_supported" in exc.codes and "not_applied" not in exc.codes, str(exc.codes))
+        else:
+            raise AssertionError("FAIL nested-preview-blocked: 嵌套目标居然预览成功")
+        try:
+            apply.apply_plan(proj, shared_plan, region=shared_region, message_id="nested")
+        except apply.PlanBlockedError as exc:
+            _ok("nested-apply-blocked", "nested_not_supported" in exc.codes and "not_applied" not in exc.codes, str(exc.codes))
+        else:
+            raise AssertionError("FAIL nested-apply-blocked: 嵌套目标居然应用成功")
+        _ok("nested-no-write", _sha(src) == before and not apply.is_dirty(proj) and apply.load_history(proj)["entries"] == [])
 
-        # Confirm writes work + session source, new ents on 图腾-新增-1, host def unchanged.
-        host_before = _host_squat_count(src, "HOST")
-        result = apply.apply_plan(proj, plan, region=region, message_id="m1")
-        _ok("confirm-ok", result["ok"] and result["can_undo"] and result["ok_count"] >= 2, str(result))
-        _ok("new-layer", str(result.get("layer") or "").startswith("图腾-新增-"), result.get("layer"))
-        _ok("source-written", _sha(src) != before)
-        _ok("official-flag", result.get("official_untouched") is False)
-        work = apply.work_path(proj)
-        _ok("work-written", work.is_file())
+        # 共享块被插在图层 0 的实例：模型空间实体自己图层是 0，但共享块里 0 层符号继承宿主，
+        # 而宿主在 0 层时 CAD 里实际继承的是共享块定义所处的图层——这一处在模型空间找不到，
+        # 不能声称已改。
+        layer0_plan = {
+            "mode": "plan",
+            "reply": "改掉共享块里的蹲便。",
+            "deletes": [{"block": "SEAT", "xy": info["layer0_xy"]}],
+        }
+        try:
+            apply.render_plan_preview(proj, layer0_plan, region, root / "layer0.png")
+        except ValueError as exc:
+            _ok("layer0-nested-not-found", "没有找到" in str(exc), str(exc))
+        else:
+            raise AssertionError("FAIL layer0-nested-not-found: 模型空间里找不到的共享块内容被当成已定位")
+        _ok("layer0-no-write", _sha(src) == before)
 
-        doc = ezdxf.readfile(str(work))
-        msp = doc.modelspace()
-        _ok("host-def-unchanged", _host_squat_count(work, "HOST") == host_before)
-        new_inserts = [e for e in msp.query("INSERT") if e.dxf.name == "SEAT"]
-        _ok("new-insert-present", len(new_inserts) == 1, str(len(new_inserts)))
-        _ok(
-            "new-insert-layer",
-            all(str(e.dxf.layer).startswith("图腾-新增-") for e in new_inserts),
-            ",".join(e.dxf.layer for e in new_inserts),
-        )
-        _ok(
-            "not-official-layer",
-            all(e.dxf.layer != "FU-TECH-卫浴" for e in new_inserts),
-        )
-        covers = [e for e in msp if e.dxftype() in {"WIPEOUT", "HATCH", "SOLID"} and str(e.dxf.layer).startswith("图腾-新增-")]
-        _ok("cover-present", len(covers) >= 1, str([e.dxftype() for e in covers]))
-        # Rotation should be aligned (SQUAT +X, rot 180 → SEAT -Y → 270), not the planned 90.
-        rot = float(new_inserts[0].dxf.rotation) % 360
-        _ok("rotation-aligned-270", min(abs(rot - 270), abs(rot + 90)) < 1.0, f"rot={rot}")
-        # Other sheet's host still has its squat (definition untouched) and no cover near it.
-        other = [e for e in msp.query("INSERT") if e.dxf.name == "HOST"]
-        _ok("both-hosts-remain", len(other) == 2)
-
-        # Undo restores original source bytes and drops work.
-        undone = apply.undo_last(proj)
-        _ok("undo-ok", undone["ok"] and undone.get("restored_official"))
-        _ok("undo-no-work", not apply.is_dirty(proj))
-        _ok("undo-no-more", undone["can_undo"] is False)
-        _ok("undo-source-bytes", _sha(src) == before, "source bytes should match pre-edit")
-        _ok("status-untouched", apply.status(proj)["official_untouched"] is True)
-
-        # Direct (top-level) replace still deletes the modelspace insert.
+        # 顶层替换：预览不写文件、不建修订；确认后写工作图与会话源，撤回恢复原字节。
         plan2 = {
             "mode": "plan",
             "reply": "删掉明装蹲便。",
@@ -244,27 +257,53 @@ def test_overlay_replace_and_undo() -> None:
                 }
             ],
         }
-        # Use a bbox that includes the top-level insert.
         region2 = {"id": "r2", "bbox": [0.0, 0.0, 2000.0, 2000.0]}
-        result2 = apply.apply_plan(proj, plan2, region=region2, message_id="m2")
-        _ok("direct-replace-ok", result2["ok"])
-        doc2 = ezdxf.readfile(str(apply.work_path(proj)))
+        dest_png = root / "preview.png"
+        preview = apply.render_plan_preview(proj, plan2, region2, dest_png)
+        _ok("preview-png", dest_png.is_file() and dest_png.stat().st_size > 0, str(dest_png.stat().st_size))
+        _ok("preview-no-revision", apply.load_history(proj)["entries"] == [])
+        _ok("preview-no-work", not apply.is_dirty(proj))
+        _ok("preview-source-untouched", _sha(src) == before)
+        _ok("preview-status-no-undo", apply.status(proj)["can_undo"] is False)
+
+        host_before = _host_squat_count(src, "HOST")
+        result = apply.apply_plan(proj, plan2, region=region2, message_id="m1")
+        _ok("confirm-ok", result["ok"] and result["can_undo"] and result["ok_count"] >= 1, str(result))
+        _ok("new-layer", str(result.get("layer") or "").startswith("图腾-新增-"), result.get("layer"))
+        _ok("source-written", _sha(src) != before)
+        _ok("official-flag", result.get("official_untouched") is False)
+        work = apply.work_path(proj)
+        _ok("work-written", work.is_file())
+        doc = ezdxf.readfile(str(work))
+        msp = doc.modelspace()
+        _ok("host-def-unchanged", _host_squat_count(work, "HOST") == host_before)
+        work_doc = ezdxf.readfile(str(work))
+        _ok(
+            "plain-host-def-unchanged",
+            sum(1 for e in work_doc.blocks.get("PLAIN_HOST") if e.dxftype() == "INSERT" and e.dxf.name == "SEAT") == 1,
+        )
         top_squats = [
             e
-            for e in doc2.modelspace().query("INSERT")
+            for e in msp.query("INSERT")
             if e.dxf.name == "SQUAT" and abs(e.dxf.insert.x - 500) < 1 and abs(e.dxf.insert.y - 600) < 1
         ]
-        top_seats = [
-            e
-            for e in doc2.modelspace().query("INSERT")
-            if e.dxf.name == "SEAT" and abs(e.dxf.insert.x - 500) < 1
-        ]
-        _ok("direct-old-deleted", top_squats == [])
-        _ok("direct-new-inserted", len(top_seats) == 1)
-        _ok("direct-new-layer", str(top_seats[0].dxf.layer).startswith("图腾-新增-"))
-        apply.undo_last(proj)
-        _ok("second-undo-restores-source", _sha(src) == before)
-
+        _ok("direct-old-deleted", top_squats == [], str(len(top_squats)))
+        new_inserts = [e for e in msp.query("INSERT") if e.dxf.name == "SEAT"]
+        _ok("new-insert-present", len(new_inserts) == 1, str(len(new_inserts)))
+        _ok(
+            "new-insert-layer",
+            all(str(e.dxf.layer).startswith("图腾-新增-") for e in new_inserts),
+            ",".join(e.dxf.layer for e in new_inserts),
+        )
+        _ok("not-official-layer", all(e.dxf.layer != "FU-TECH-卫浴" for e in new_inserts))
+        other = [e for e in msp.query("INSERT") if e.dxf.name in {"HOST", "PLAIN_HOST"}]
+        _ok("both-hosts-remain", len(other) == 4, str([e.dxf.name for e in other]))
+        undone = apply.undo_last(proj)
+        _ok("undo-ok", undone["ok"] and undone.get("restored_official"))
+        _ok("undo-no-work", not apply.is_dirty(proj))
+        _ok("undo-no-more", undone["can_undo"] is False)
+        _ok("undo-source-bytes", _sha(src) == before, "source bytes should match pre-edit")
+        _ok("status-untouched", apply.status(proj)["official_untouched"] is True)
 
 def _host_squat_count(dxf: Path, host: str) -> int:
     import ezdxf
