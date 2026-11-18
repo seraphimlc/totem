@@ -164,16 +164,28 @@ def ensure_work_copy(proj: dict[str, Any]) -> Path:
     return dest
 
 
+def _new_work_copy(proj: dict[str, Any]) -> bool:
+    """保证有工作副本；这次是新建的返回 True（写失败时要撤掉的就是它）。"""
+    existed = is_dirty(proj)
+    ensure_work_copy(proj)
+    return not existed
+
+
 def _snapshot_path(proj: dict[str, Any], rev: int) -> Path:
     return revisions_dir(proj) / f"rev-{rev:04d}.dxf.gz"
 
 
 def _write_snapshot(src: Path, dest: Path) -> None:
+    """把 src 快照到 dest：先完整写到 <stem>.tmp.gz，再原子替换，中途失败不留半个文件。"""
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(".tmp.gz")
-    with src.open("rb") as fh, gzip.open(tmp, "wb") as out:
-        shutil.copyfileobj(fh, out)
-    tmp.replace(dest)
+    try:
+        with src.open("rb") as fh, gzip.open(tmp, "wb") as out:
+            shutil.copyfileobj(fh, out)
+        tmp.replace(dest)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _restore_snapshot(src: Path, dest: Path) -> None:
@@ -751,43 +763,62 @@ def _add_insert(
     layer_name = _ensure_layer(doc, layer)
     sx, sy, sz = _scale_tuple(item.get("scale"))
     rot = _choose_rotation(doc, item, found, name)
-    imported = False
+    insert_dxfattribs = {"layer": layer_name, "rotation": rot, "xscale": sx, "yscale": sy, "zscale": sz}
     # 探测一律在隔离副本里做：本图一个像素都不加，绝不让「新块」绕过保护判断，也不在调用方
     # 的图里留下试插的实体。库里的块（外加本图已有的定义 / 图层，让 0 层继承看出真实图层）
     # 一起放进副本，重复插同一个块也看得见。
     work = _import_isolated(name, layer_sources=doc, base=doc)
     if work is None:
         return {"ok": False, "reason": f"图纸和默认组件库里都没有块「{name}」", "block": name, "xy": xy}
-    imported = name not in doc.blocks
     try:
-        probe = work.modelspace().add_blockref(
-            name,
-            insert=xy,
-            dxfattribs={"layer": layer_name, "rotation": rot, "xscale": sx, "yscale": sy, "zscale": sz},
-        )
+        probe = work.modelspace().add_blockref(name, insert=xy, dxfattribs=dict(insert_dxfattribs))
     except Exception as exc:
         return {"ok": False, "reason": f"块「{name}」插入失败，这一处没有写：{exc}", "block": name, "xy": xy}
     check = _guard_new_block(work, probe, found)
     if check:
         return check
-    # 守卫通过后才往本图里导入库块；插失败就把刚导入的块定义撤回。
-    if imported and name not in doc.blocks and not _import_block(doc, name):
-        return {"ok": False, "reason": f"图纸和默认组件库里都没有块「{name}」", "block": name, "xy": xy}
-    created = []
+    # 守卫通过后才往本图里导入库块。INSERT 之后才可能让副本跨到本图：生产代码里任何一步
+    # 抛错都不能留在调用方的图上——撤掉这次新建的实体，只有「这次刚导入、且再没有别的 INSERT
+    # 引用」的定义才撤。已在本图的定义不碰。
+    fresh_def = name not in doc.blocks
+    # None = 没拍成：之后不会拿它当底数扫布局 / 认领新实体（见 _layout_snapshot）。
+    before = _layout_snapshot(msp)
+    if fresh_def:
+        try:
+            available = bool(_import_block(doc, name))
+        except Exception as exc:
+            # 导入这一步不可能造出 INSERT：只撤回这次导入了一半的块定义（没有别的引用时才撤）。
+            _remove_insert_probe(doc, msp, [], name, before=before, fresh_def=True, allow_scan=False)
+            return {"ok": False, "reason": f"块「{name}」插入失败，这一处没有写：{exc}", "block": name, "xy": xy}
+        if not available:
+            return {"ok": False, "reason": f"图纸和默认组件库里都没有块「{name}」", "block": name, "xy": xy}
     try:
-        ref = msp.add_blockref(
-            name,
-            insert=xy,
-            dxfattribs={"layer": layer_name, "rotation": rot, "xscale": sx, "yscale": sy, "zscale": sz},
-        )
-        created.append(ref)
+        returned = msp.add_blockref(name, insert=xy, dxfattribs=dict(insert_dxfattribs))
     except Exception as exc:
-        # 插了一半（add_blockref 抛错也可能已经建了实体）：在写盘前把这次新建的都撤掉。
-        if imported:
-            _remove_insert_probe(doc, msp, created, name)
+        # 不管建到哪一步抛错：不在 before 快照里的新实体（含已建成、没返回的，和只绑了 handle
+        # 没挂进布局的半成品）都撤掉；这次刚导入、又没人用的块定义也撤；本图原有的定义不碰。
+        _remove_insert_probe(doc, msp, [], name, before=before, fresh_def=fresh_def)
         return {"ok": False, "reason": f"块「{name}」插入失败，这一处没有写：{exc}", "block": name, "xy": xy}
+    # add_blockref 的返回值不能全信：记下来的实体可以是这次新建的，也可能不是。只认「不在
+    # before 快照里、确实还挂在布局上」的实体；它建出来却没记（返回值不是它）的同样会被撤。
+    # 注意别覆盖参数 found（替换目标）：下面 rot_adjusted 还要用它。
+    new_ref, extra = _new_layout_entities(msp, before)
+    ref = new_ref
+    if returned is not None and not _gone(returned) and _handle_of(returned) in _layout_handles(msp):
+        ref = returned  # 返回值确实是还挂着的实体：以它为准（不再去找别的）
+    if ref is None:
+        # add_blockref 返回了、却找不到它建出来的实体：不能胡乱删别人，只能如实报失败，这个块不认领。
+        log.error("insert of %s returned but no new entity was found", name)
+        return {
+            "ok": False,
+            "reason": f"块「{name}」插入后没能确认新实体，这一处没有写",
+            "block": name,
+            "xy": xy,
+        }
+    if extra:
+        log.warning("insert of %s created %d unexpected entities", name, len(extra))
     out = {"ok": True, "action": "insert", "block": name, "xy": xy, "layer": layer_name, "rot": rot, "handle": ref.dxf.handle}
-    if imported:
+    if fresh_def:
         out["imported"] = True
     if snapped:
         out["snapped"] = True
@@ -1092,26 +1123,151 @@ def _remove_entity(msp, ent) -> bool:
     return _gone(ent)
 
 
-def _remove_insert_probe(doc, msp, probes, name: str) -> None:
-    """撤回这次新建的 INSERT（``probes``），以及（若没有任何引用了）为它导入的块定义。
-
-    只删 ``probes`` 里的实体，不碰调用方图里原有的同名插入；块定义只有在没有别的 INSERT
-    （任何布局 / 块定义里）引用时才删，不会删掉本来就在图里的定义。探测用的 INSERT 只加在
-    隔离副本里，``probes`` 一般是空的：这里只处理真的动过本图的情况。
-    """
-    probes = [p for p in (probes or []) if p is not None]
-    for probe in probes:
-        if _gone(probe):
-            continue
-        _remove_entity(msp, probe)
+def _layout_handles(layout) -> set[str]:
+    """布局里现在挂着的实体句柄。``entity_space`` 是布局实际持有的实体列表（未销毁的）。"""
+    handles: set[str] = set()
+    space = getattr(layout, "entity_space", None)
+    if space is None:
+        space = layout
     try:
-        if doc.blocks.get(name) is None:
+        for ent in space:
+            handle = _handle_of(ent)
+            if handle:
+                handles.add(handle)
+    except Exception:
+        return set()
+    return handles
+
+
+def _layout_snapshot(msp) -> Optional[set[str]]:
+    """写 INSERT 之前拍一下布局里已有的句柄。拍不出来返回 None——**不是空集**：
+    空集会被当成「写之前布局是空的」，等于把所有已有实体都认成这次新建的（误删 / 误认领）。
+    """
+    try:
+        return _layout_handles(msp)
+    except Exception:
+        log.exception("layout snapshot failed, rollback will only handle known entities")
+        return None
+
+
+def _new_layout_entities(msp, before) -> tuple[Any, list]:
+    """写 INSERT 之后：返回这次新出现的 (第一个新实体, 其余新实体)。一个也没认出时返回 (None, [])。
+
+    ``before`` 是 ``_layout_snapshot`` 的结果；为 None（快照没拍成）或拍完布局拿不出来时
+    一律返回 (None, [])：没有底数就分不清新旧，宁可认不出、也不把原有实体当成本次新建的。
+    """
+    if before is None:
+        return None, []
+    try:
+        after = list(msp.entity_space)
+    except Exception:
+        return None, []
+    fresh = [ent for ent in after if _handle_of(ent) not in before]
+    if not fresh:
+        return None, []
+    return fresh[0], fresh[1:]
+
+
+def _referencing_layout(doc, ent) -> Any:
+    try:
+        layout = ent.get_layout()
+        if layout is not None:
+            return layout
+    except Exception:
+        pass
+    doc_ = getattr(ent, "doc", None)
+    return getattr(doc_, "modelspace", lambda: None)() if doc_ is not None else None
+
+
+def _remove_insert_probe(
+    doc, msp, probes, name: str, *, before=None, fresh_def: bool = False, allow_scan: bool = True
+) -> None:
+    """撤回这次新建的 INSERT，以及（若没有任何引用了）为它导入的块定义。
+
+    - 要撤的实体 = ``probes`` + 「不在 ``before`` 快照里、或已经没有句柄还在实体库里的新实体」
+      ——包括 add_blockref 抛错前已经建出来、根本没返回的实体，和只绑了 handle、没挂进布局
+      的半成品。只撤这些，不碰调用方图里原有的同名插入。
+    - ``allow_scan=False``：「插入前」那一步（导入库块）抛错时用。这一步不可能造出 INSERT；
+      要撤的只剩这次尝试导入、却没有插上的块定义，绝不按句柄扫布局（扫描只凭「不在快照里」
+      判断，万一有别的代码路径在这段时间往布局里加了实体，就会被误删）。
+    - ``before`` 为 None（写之前没拍成快照，或拍完布局就取不出来了）：没有底数就分不清新旧，
+      同样不扫，只撤 ``probes`` 里明确知道的实体，绝不把已有实体当成残留。
+    - 块定义只在 ``fresh_def``（这次插入前本图没有它）、并且任何布局 / 块定义里都没有别的
+      INSERT 引用它时才删。本来就在图里的定义一律不碰。都不成就如实记一条 error 日志：
+      这时不能假装撤回成功。
+    """
+    doomed = [p for p in (probes or []) if p is not None]
+    # 快照没拍成（None）或布局拿不出来：没有底数，扫一圈会把所有已有实体都当成残留误删，
+    # 所以不扫，只撤明确知道的 probes。
+    scan = allow_scan and before is not None
+    after: list = []
+    if scan:
+        try:
+            after = list(msp.entity_space)
+        except Exception:
+            log.exception("layout scan failed, rollback will only handle known entities")
+            scan = False
+    if scan:
+        for ent in after:
+            if ent in doomed:
+                continue
+            handle = None if _gone(ent) else _handle_of(ent)
+            if handle and handle in before:
+                continue  # 写之前就有的实体，不归这次管
+            doomed.append(ent)  # 不在快照里（或已经销毁）→ 是这次造的残留
+    asked_layout = False
+    for ent in doomed:
+        if _gone(ent):
+            continue
+        doc_ = getattr(ent, "doc", None)
+        handle = _handle_of(ent)
+        if doc_ is not None and handle:
+            behind = doc_.entitydb.get(handle)
+            if behind is None or behind is not ent:
+                continue  # 实体库里已经不是它了（已经撤掉 / 被换掉），不要动别人的记录
+        if not asked_layout:
+            asked_layout = True
+            # _owner_layout 会问 get_layout()：对「句柄已建、还没挂进布局」的半成品，ezdxf 会照
+            # owner 去反查块记录、顺手修一遍指向，这时还不该修。等干净了再问。
+            try:
+                ent.get_layout()
+            except Exception:
+                pass
+        layout = _referencing_layout(doc, ent) or msp
+        linked = layout is not None and handle is not None and handle in _layout_handles(layout)
+        if linked:
+            if not _remove_entity(layout, ent):
+                log.error("rollback could not remove INSERT %s of %s from its layout", handle, name)
+            continue
+        # 只绑了 handle、没挂进布局的半成品（或已经没有句柄的）：没有别处引用，从实体库里丢掉。
+        # 光 destroy 不够：它占着句柄，导出时仍会被写成一个没有 owner 的孤儿实体。
+        try:
+            if doc_ is not None and handle:
+                doc_.entitydb.discard(ent)
+        except Exception:
+            log.exception("rollback could not discard half-created INSERT %s of %s", handle, name)
+        still_there = doc_ is not None and handle is not None and doc_.entitydb.get(handle) is not None
+        if not still_there:
+            try:
+                if ent.is_alive:
+                    ent.dxf.discard("handle")
+            except Exception:
+                pass
+    try:
+        if not fresh_def or doc.blocks.get(name) is None:
             return
         for layout in [doc.modelspace(), *doc.blocks]:
+            try:
+                own = _layout_handles(layout)
+            except Exception:
+                continue
             for ent in layout.query("INSERT"):
-                if ent not in probes and str(ent.dxf.name) == name and not _gone(ent):
-                    return
+                handle = _handle_of(ent)
+                if handle in own and str(ent.dxf.name) == name and not _gone(ent):
+                    return  # 还有引用（包括没撤掉的这次插入），定义必须留着
         doc.blocks.delete_block(name, safe=True)
+        if doc.blocks.get(name) is not None:
+            log.error("rollback could not remove imported block definition %s", name)
     except Exception:
         log.exception("remove insert probe for %s failed", name)
 
@@ -1435,48 +1591,84 @@ def apply_mutations(
             results.append(_with_issue_code({"ok": False, **check, "reason": reason}, codes, "replace", idx))
             continue
         found = check.get("found")
-        # 旧块的一切都要在动旧块之前取好：delete_entity 会把实体和它的属性一起销毁。
-        old_entity = found.get("entity")
-        old_layer = _layer_name(old_entity)
-        carry = _attributes_to_carry(doc, msp, item, bbox)
-        ins = dict(item)
-        ins.setdefault("xy", new_xy)
-        created = _add_insert(
-            doc, msp, ins, layer, bbox, found=found,
-            region=region, index=index, snap_kind="replace",
-        )
-        if not created.get("ok"):
+        # 整条替换一个异常都不往外逃：新块那一步抛错时旧块还没动（原样保留、新块撤回）；
+        # 旧块删成功之后才出的错，如实报失败并说明「现状」。不把崩溃当成功。
+        landed = False
+        created: dict[str, Any] = {}
+        removed: dict[str, Any] = {}
+        carry: dict[str, str] = {}
+        old_layer = ""
+        try:
+            # 旧块的一切都要在动旧块之前取好：delete_entity 会把实体和它的属性一起销毁。
+            old_entity = found.get("entity")
+            old_layer = _layer_name(old_entity)
+            carry = _attributes_to_carry(doc, msp, item, bbox)
+            ins = dict(item)
+            ins.setdefault("xy", new_xy)
+            created = _add_insert(
+                doc, msp, ins, layer, bbox, found=found,
+                region=region, index=index, snap_kind="replace",
+            )
+            if created.get("ok"):
+                if found.get("kind") == "direct":
+                    # 原位置本来就是普通顶层图块：就地删掉这一个，不做覆盖。
+                    removed = _delete_direct(msp, found)
+                else:
+                    removed = _hide_or_delete(doc, msp, old_item, bbox, layer)
+                if removed.get("ok"):
+                    landed = True
+                else:
+                    _rollback_created(doc, msp, created)
+        except Exception as exc:
+            log.exception("replace crashed for %s", item.get("from_block") or item.get("block"))
+            why = f"替换出错：{exc}"
+            if landed:
+                results.append(_with_issue_code(
+                    {
+                        "ok": False,
+                        "reason": f"{why}；原图块已删除、新图块已写入，后续步骤没有完成，请检查这一处",
+                        "block": item.get("block"),
+                        "issue_code": "replace_error",
+                    },
+                    codes, "replace", idx,
+                ))
+            else:
+                results.append(_with_issue_code(
+                    {
+                        "ok": False,
+                        "reason": f"{why}；原图块保留，没有改动",
+                        "block": item.get("block"),
+                        "issue_code": "replace_error",
+                    },
+                    codes, "replace", idx,
+                ))
+            continue
+        if landed:
+            if carry:
+                ref = created.get("handle") and doc.entitydb.get(created["handle"])
+                try:
+                    applied = _apply_carried_attribs(doc, ref, carry, old_layer)
+                except Exception:
+                    # 属性没抄过去不是「替换没做成」：旧块已经删了，如实标出来，不让整条替换报失败。
+                    log.exception("carry attribs failed for %s", created.get("block"))
+                    applied = {}
+                    created["attribs_failed"] = True
+                if applied:
+                    created["attribs"] = applied
+            results.append(removed)
+            results.append(created)
+        elif created.get("ok"):
+            # 新块插上了、旧块没删掉：如实报失败，并说明新块已经撤回。
+            results.append(_with_issue_code(
+                {**removed, "reason": f"替换没有完成，原图块没能删掉，新图块已撤回：{removed.get('reason') or ''}"},
+                codes, "replace", idx,
+            ))
+        else:
             # 新块没插上：旧块一个都还没动，保留原样，只报失败。
             results.append(_with_issue_code(
                 {**created, "reason": f"替换没有执行，原图块保留：{created.get('reason') or '新图块没有写上'}"},
                 codes, "replace", idx,
             ))
-            continue
-        if found.get("kind") == "direct":
-            # 原位置本来就是普通顶层图块：就地删掉这一个，不做覆盖。
-            removed = _delete_direct(msp, found)
-        else:
-            removed = _hide_or_delete(doc, msp, old_item, bbox, layer)
-        if not removed.get("ok"):
-            _rollback_created(doc, msp, created)
-            results.append(_with_issue_code(
-                {**removed, "reason": f"替换没有完成，原图块没能删掉，新图块已撤回：{removed.get('reason') or ''}"},
-                codes, "replace", idx,
-            ))
-            continue
-        if carry:
-            ref = created.get("handle") and doc.entitydb.get(created["handle"])
-            try:
-                applied = _apply_carried_attribs(doc, ref, carry, old_layer)
-            except Exception:
-                # 属性没抄过去不是「替换没做成」：旧块已经删了，如实标出来，不让整条替换报失败。
-                log.exception("carry attribs failed for %s", created.get("block"))
-                applied = {}
-                created["attribs_failed"] = True
-            if applied:
-                created["attribs"] = applied
-        results.append(removed)
-        results.append(created)
     for idx, item in enumerate(plan.get("moves") or []):
         if not isinstance(item, dict):
             results.append({"ok": False, "reason": "移动项格式不对", "item": item})
@@ -1949,35 +2141,66 @@ def apply_plan(
     # 先在当前图上跑一遍（只读）：目标在保护层/共享块里这类问题在写任何文件之前就拦下。
     source_doc = _read_doc(current_dxf(proj), encoding)
     plan, issues, _result = validate_for_apply(plan, source_doc, bbox=bbox, region=region)
-    dest = ensure_work_copy(proj)
+    new_work = _new_work_copy(proj)
+    dest = work_path(proj)
     official = official_dxf(proj)
     hist = load_history(proj)
     next_rev = (hist["entries"][-1]["rev"] + 1) if hist["entries"] else 1
-    _ensure_original_snapshot(proj)
+    original_snap = original_snapshot_path(proj)
+    had_original = original_snap.is_file() and original_snap.stat().st_size > 0
+    # 原图快照也等到这一步真的写成了再补：这一次没写成就什么都不留。
     snap = _snapshot_path(proj, next_rev)
     _write_snapshot(dest, snap)
+
+    def _abandon(reason: str) -> None:
+        """这一步没写成：不保存写了一半的内存图，撤掉刚建的快照；
+        若这一步本来会是第一次写入（还没有工作副本），也不留下新工作副本。"""
+        if snap.is_file():
+            snap.unlink(missing_ok=True)
+        if not had_original:
+            try:
+                original_snap.unlink(missing_ok=True)
+            except OSError:
+                log.exception("remove original snapshot after failed first apply")
+        if new_work:
+            # 还没有任何一步写进去过（load_history 读不到历史），这次新建的工作副本没人认领。
+            try:
+                work_path(proj).unlink(missing_ok=True)
+            except OSError:
+                log.exception("remove work copy after failed apply")
+        if reason:
+            log.warning("apply aborted: %s", reason)
 
     # 与预览同一条路径（同一函数读文件），在快照后、保存前写内存副本。
     doc = _read_doc(dest, encoding)
     layer = _ensure_layer(doc, f"{NEW_LAYER_PREFIX}-{next_rev}")
-    results = apply_mutations(doc, plan, bbox=bbox, layer=layer, region=region, issues=issues)
+    try:
+        results = apply_mutations(doc, plan, bbox=bbox, layer=layer, region=region, issues=issues)
+    except BaseException as exc:
+        # 写内存副本时抛错（包括被拦下的方案）：dest 没被覆盖，但快照 / 新工作副本要撤掉。
+        # 打断（CancelledError 等）原样再抛，不吞。
+        _abandon(f"apply_mutations raised {type(exc).__name__}")
+        raise
     snapped_count = sum(1 for r in results if r.get("snapped"))
 
     ok_n = sum(1 for r in results if r.get("ok"))
     fail_n = len(results) - ok_n
     if ok_n == 0:
-        if snap.is_file():
-            snap.unlink()
-        if next_rev == 1 and not hist["entries"]:
-            # 还没写过任何一步：这次没改成功就不该留下工作副本。
-            try:
-                work_path(proj).unlink(missing_ok=True)
-            except OSError:
-                log.exception("remove work copy after failed first apply")
         reasons = [r.get("reason") for r in results if r.get("reason")]
+        _abandon(reasons[0] if reasons else "方案里没有能写进工作图的改动。")
         if all_blocking(results):
             raise _plan_blocked(mutation_blocked(results))
         raise ValueError(reasons[0] if reasons else "方案里没有能写进工作图的改动。")
+    crashed = [r for r in results if not r.get("ok") and r.get("issue_code") == "replace_error"]
+    if crashed:
+        # 有一项替换炸在半路上（见 apply_mutations 的替换循环）：这一次不写盘，如实报失败，
+        # 不让写入端把「替换出错」当成已完成的这一步（哪怕别的改动本来能写）。
+        reasons = [r.get("reason") for r in crashed if r.get("reason")]
+        _abandon("replace crashed")
+        raise ValueError(
+            (reasons[0] if reasons else "替换出错")
+            + "；这一步没有写入工作图，其他改动也没有保存，请重试或拆开执行"
+        )
 
     old_base = None
     if bbox:
@@ -1987,8 +2210,14 @@ def apply_plan(
         except Exception:
             old_base = None
 
-    _save_doc(doc, dest)
-    _write_session_source(proj, dest)
+    try:
+        _ensure_original_snapshot(proj)
+        _save_doc(doc, dest)
+        _write_session_source(proj, dest)
+    except BaseException as exc:
+        # 保存中途失败：dest 是原子替换的（失败时原文件不动），快照 / 新工作副本照样撤掉。
+        _abandon(f"save failed: {type(exc).__name__}")
+        raise
 
     if old_base and bbox:
         try:

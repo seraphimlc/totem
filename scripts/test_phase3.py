@@ -1722,6 +1722,327 @@ def test_delete_public_api_and_attribs() -> None:
         _ok("api-new-attrib-carried", bool(new_ref) and [a.dxf.text for a in new_ref[0].attribs] == ["W-12"], str([(a.dxf.tag, a.dxf.text) for a in new_ref[0].attribs]) if new_ref else "")
 
 
+# ================================================================ J2. 写图半路抛错：不留残余
+
+
+def _carry_crash_doc(path: Path) -> None:
+    """一张带着旧块+属性、基础块的小图：SINK 有属性「编号」，SEAT_NEW / BASIN 都在本图。"""
+    doc = _new_doc()
+    sink = doc.blocks.new("SINK")
+    _square(sink, 400)
+    sink.add_attdef("编号", (0, 0), dxfattribs={"layer": "0", "height": 20})
+    for name in ("SEAT_NEW", "BASIN"):
+        _square(doc.blocks.new(name), 400)
+    ref = doc.modelspace().add_blockref("SINK", (5000, 5000), dxfattribs={"layer": "设备"})
+    ref.add_attrib("编号", "S-01", (0, 0), dxfattribs={"layer": "0", "height": 20})
+    doc.saveas(str(path))
+
+
+class _PartialAdd:
+    """只在调用方的那张图上「半路抛错」的 add_blockref 补丁，可当上下文管理器用。
+
+    探测用的隔离副本是另一张文档：那里走真正的 add_blockref（否则 _add_insert 的试插先抛错，
+    调用方的图根本没被碰过，回归就成了空转）。调用方布局被叫到几次记在 ``calls`` 里，测试据此
+    断言「调用方的插入真的走到了」。
+    """
+
+    def __init__(self, fail_after_add: bool):
+        from ezdxf.entities import factory as _factory
+        from ezdxf.layouts import Modelspace as _Modelspace
+
+        self.fail_after_add = fail_after_add
+        self._factory = _factory
+        self._Modelspace = _Modelspace
+        self._real = _Modelspace.add_blockref
+        self._targets: list = []  # [doc, 模型空间 layout, 调用次数]
+        self.calls = 0
+        self._patch = None
+
+    def target(self, caller_doc) -> "_PartialAdd":
+        """以后这张文档（及其模型空间布局）的 add_blockref 才半路抛错。"""
+        if not any(t[0] is caller_doc for t in self._targets):
+            self._targets.append([caller_doc, caller_doc.modelspace(), 0])
+        return self
+
+    def calls_on(self, caller_doc) -> int:
+        return sum(n for d, _msp, n in self._targets if d is caller_doc)
+
+    def _hit(self, layout) -> None:
+        hit_doc = getattr(layout, "doc", None)
+        for target in self._targets:
+            if target[1] is layout or (hit_doc is not None and target[0] is hit_doc):
+                target[2] += 1
+        self.calls += 1
+
+    def __call__(self, layout, name, insert, dxfattribs=None):
+        if any(layout is t[1] for t in self._targets):
+            if self.fail_after_add:
+                # 先真的建出来、挂进布局（调用方图上确实多了一个 INSERT），然后才抛错。
+                self._real(layout, name, insert, dxfattribs)
+                self._hit(layout)
+                raise RuntimeError("simulated add_blockref failure after entity creation")
+            # 更早的半路失败：不先成功加一次。实体在实体库里绑好 handle，却没挂进布局就抛错。
+            self._hit(layout)
+            self._factory.new("INSERT", dxfattribs=dict(dxfattribs or {}, name=name), doc=layout.doc)
+            raise RuntimeError("simulated add_blockref failure before layout link")
+        # 隔离副本里的试插等：真实现，不让探测这一步替调用方「先失败」。
+        return self._real(layout, name, insert, dxfattribs)
+
+    def start(self):
+        self._patch = mock.patch.object(self._Modelspace, "add_blockref", autospec=True, side_effect=self)
+        return self._patch.start()
+
+    def stop(self):
+        if self._patch is not None:
+            self._patch.stop()
+            self._patch = None
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stop()
+        return False
+
+
+def _partial_add(fail_after_add: bool) -> _PartialAdd:
+    """真的用 ezdxf 建出实体之后才抛错的 add_blockref（不是一上来就 mock 成 raise）。
+
+    用法：``with _partial_add(True).target(doc) as patch: ...``——只有 ``doc`` 会半路抛错；
+    没 ``target`` 任何文档时它是空的（哪里都不失败），测试也不会因此静默变空转。
+    """
+    return _PartialAdd(fail_after_add)
+
+
+def _insert_entities(doc, name: str) -> list:
+    """实体库里所有活着的、名字是 name 的 INSERT（不管有没有挂进模型空间）。"""
+    return [e for e in doc.entitydb.values() if e.dxftype() == "INSERT" and e.dxf.name == name]
+
+
+def _orphan_inserts(doc) -> list:
+    """有句柄（会写进 DXF）却不在任何布局里的实体：只有「插了一半」才会留下这种。"""
+    out = []
+    for ent in doc.entitydb.values():
+        if ent.dxftype() != "INSERT" or _gone_ent(ent):
+            continue
+        try:
+            layout = ent.get_layout()
+        except Exception:
+            layout = None
+        if layout is None or ent.dxf.handle not in {e.dxf.handle for e in layout}:
+            out.append(ent.dxf.handle)
+    return out
+
+
+def _gone_ent(ent) -> bool:
+    return (not ent.is_alive) or getattr(ent, "doc", None) is None
+
+
+def _disk_state(proj: dict) -> tuple:
+    root = Path(proj["root"])
+
+    def _bytes(path: Path):
+        return path.read_bytes() if path.is_file() else None
+
+    studio = root / ".studio"
+    snaps = sorted(p.name for p in (studio / "revisions").glob("*.gz")) if (studio / "revisions").is_dir() else []
+    return (
+        _bytes(Path(proj["dxf_path"])),
+        _bytes(apply.work_path(proj)),
+        _bytes(apply.history_path(proj)),
+        tuple(snaps),
+    )
+
+
+def _crash_replace(doc, plan: dict, patch, *, expect: int = 1) -> list:
+    """在 ``patch`` 下对 ``doc`` 跑一次方案，返回结果；断言补丁确实打到了调用方这张图（不是空转）。"""
+    patch.target(doc)
+    results = apply.apply_mutations(doc, dict(plan), bbox=BOX, layer="L", region=REGION, issues=[])
+    _ok(
+        "carry-insert-crash:caller-add-reached",
+        patch.calls_on(doc) == expect,
+        f"calls={patch.calls_on(doc)} expect={expect}",
+    )
+    return results
+
+
+def test_carry_insert_crash_is_clean() -> None:
+    """替换时 _add_insert 在本图里建出实体之后才抛错：原块保留、新块/新导入的定义不留、后续照常。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        src = root / "crash.dxf"
+        _carry_crash_doc(src)
+        replace = {"replaces": [{"from_block": "SINK", "from_xy": [5000, 5000], "block": "SEAT_NEW", "xy": [5000, 5000]}]}
+
+        for label, fail_after_add in (("after", True), ("before", False)):
+            doc = apply._read_doc(src)
+            with _partial_add(fail_after_add) as patch:
+                results = _crash_replace(doc, replace, patch)
+            _ok(f"carry-insert-crash:{label}-not-ok", len(results) == 1 and not results[0].get("ok"), str(_brief(results)))
+            _ok(f"carry-insert-crash:{label}-reason-cn", _has_cn(results[0].get("reason")), str(results[0].get("reason")))
+            _ok(f"carry-insert-crash:{label}-reason-kept", "保留" in str(results[0].get("reason")), str(results[0].get("reason")))
+            _ok(f"carry-insert-crash:{label}-no-ok-insert", not any(r.get("ok") and r.get("action") == "insert" for r in results), str(_brief(results)))
+            _ok(f"carry-insert-crash:{label}-original-kept", _insert_names(doc).count("SINK") == 1, str(_insert_names(doc)))
+            _ok(f"carry-insert-crash:{label}-no-new-insert", _insert_entities(doc, "SEAT_NEW") == [], str([e.dxf.handle for e in _insert_entities(doc, "SEAT_NEW")]))
+            _ok(f"carry-insert-crash:{label}-no-new-attribs", not any(e.dxftype() == "ATTRIB" and e.dxf.tag == "编号" and e.dxf.text != "S-01" for e in doc.entitydb.values()))
+            # 半成品不能留在实体库里（有句柄却不在任何布局里，写盘时会变成孤儿实体）
+            _ok(f"carry-insert-crash:{label}-no-orphan", _orphan_inserts(doc) == [], str(_orphan_inserts(doc)))
+            _ok(
+                f"carry-insert-crash:{label}-entitydb-exact",
+                sorted((e.dxftype(), e.dxf.name if e.dxftype() == "INSERT" else "") for e in doc.entitydb.values() if e.dxftype() in ("INSERT", "ATTRIB"))
+                == [("ATTRIB", ""), ("INSERT", "SINK")],
+                str([(e.dxftype(), e.dxf.handle) for e in doc.entitydb.values() if e.dxftype() in ("INSERT", "ATTRIB", "SEQEND")]),
+            )
+            # 存盘后同样干净
+            out = root / f"crash-{label}-out.dxf"
+            doc.saveas(str(out))
+            _ok(
+                f"carry-insert-crash:{label}-saved-clean",
+                _count_name(out, "SINK") == 1 and _count_name(out, "SEAT_NEW") == 0,
+                str(_insert_names(ezdxf.readfile(str(out)))),
+            )
+
+        # 失败之后的同一张内存图：原块还在，后续的插入 / 替换行为照常（不会找到残留的同名双胞胎）。
+        for label, fail_after_add in (("after", True), ("before", False)):
+            doc = apply._read_doc(src)
+            with _partial_add(fail_after_add) as patch:
+                _crash_replace(doc, replace, patch)
+            results = apply.apply_mutations(doc, dict(replace), bbox=BOX, layer="L", region=REGION, issues=[])
+            _ok(f"carry-insert-crash:{label}-retry-ok", len(results) == 2 and all(r.get("ok") for r in results), str(_brief(results)))
+            _ok(f"carry-insert-crash:{label}-retry-swaps-once", _insert_names(doc).count("SINK") == 0 and _insert_names(doc).count("SEAT_NEW") == 1, str(_insert_names(doc)))
+            _ok(
+                f"carry-insert-crash:{label}-retry-handles-live",
+                all(r.get("handle") in doc.entitydb for r in results if r.get("handle")),
+                str(_brief(results)),
+            )
+            results = apply.apply_mutations(
+                doc, {"inserts": [{"block": "BASIN", "xy": [7000, 11000]}]}, bbox=BOX, layer="L", region=REGION, issues=[]
+            )
+            _ok(f"carry-insert-crash:{label}-later-insert-ok", results[0].get("ok") is True, str(_brief(results)))
+            _ok(f"carry-insert-crash:{label}-later-insert-once", _insert_names(doc).count("BASIN") == 1, str(_insert_names(doc)))
+
+        # 预览走的是内存副本：失败路径与 apply 同样干净（预览不落盘、也没有残留）。
+        try:
+            apply.render_plan_preview(_proj(root / "sess-1", src), {"mode": "plan", "reply": "换台盆", **replace}, REGION, root / "crash.png")
+        except Exception:
+            pass
+        _ok("carry-insert-crash:preview-source-unchanged", _count_name(src, "SINK") == 1 and _count_name(src, "SEAT_NEW") == 0)
+
+    # ------------------------------------------------ 真实入口 apply_plan（磁盘）
+    # apply_plan 自己从工作副本读图，调用方那张 doc 拿不到：写图前读图（_read_doc）时记下它。
+    for label, fail_after_add in (("after", True), ("before", False)):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src, proj, _info = _fresh(root, f"entry-{label}.dxf")
+            before = _disk_state(proj)
+            docs = []
+            work_doc = []
+            real_read_doc = apply._read_doc
+
+            def _read_doc_spy(path, *args, **kwargs):
+                doc = real_read_doc(path, *args, **kwargs)
+                docs.append(doc)
+                if Path(path).resolve() == apply.work_path(proj).resolve():
+                    work_doc.append(doc)
+                    patch.target(doc)  # 只让真正写的那张图半路抛错
+                return doc
+
+            failure = None
+            with mock.patch.object(apply, "_read_doc", side_effect=_read_doc_spy), _partial_add(fail_after_add) as patch:
+                try:
+                    out = apply.apply_plan(proj, {"mode": "plan", "reply": "换台盆", **replace}, region=REGION, message_id="c")
+                except ValueError as exc:
+                    failure = exc
+                else:
+                    raise AssertionError(f"FAIL carry-insert-crash:{label}-entry-raises: 换块失败却返回 ok={out.get('ok')}")
+            # 调用方那张图 = 从工作副本读进来、真正写的那一张；只有它会被补丁半路打断。
+            _ok(
+                f"carry-insert-crash:{label}-entry-work-doc",
+                len(work_doc) == 1 and work_doc[0] is not docs[0],
+                f"reads={len(docs)} work_reads={len(work_doc)}",
+            )
+            _ok(f"carry-insert-crash:{label}-entry-caller-add-reached", patch.calls_on(work_doc[0]) == 1 if work_doc else False, f"calls={patch.calls}")
+            _ok(f"carry-insert-crash:{label}-entry-raises", _has_cn(failure) and "保留" in str(failure), str(failure))
+            after = _disk_state(proj)
+            _ok(f"carry-insert-crash:{label}-entry-official", after[0] == before[0])
+            _ok(f"carry-insert-crash:{label}-entry-no-work", after[1] is None, str(apply.work_path(proj)))
+            _ok(f"carry-insert-crash:{label}-entry-no-history", after[2] == before[2], str(after[2]))
+            _ok(f"carry-insert-crash:{label}-entry-no-rev", after[3] == before[3], f"{before[3]} -> {after[3]}")
+            _ok(f"carry-insert-crash:{label}-entry-original-kept", _count_name(src, "SINK") == 1, str(_insert_names(apply._read_doc(src))))
+            _ok(f"carry-insert-crash:{label}-entry-new-absent", _count_name(src, "SEAT_NEW") == 0)
+            leftovers = [
+                p.name
+                for p in Path(proj["root"]).rglob("*")
+                if ".studio" in p.parts and (p.name.endswith(".tmp.dxf") or p.name.endswith(".tmp.gz") or p.name.endswith(".write.dxf"))
+            ]
+            _ok(f"carry-insert-crash:{label}-entry-no-tmp", leftovers == [], str(leftovers))
+            # 后续正常的 apply_plan 在磁盘上照样可用：从原图起算第 1 次写入，原块 1 个、新块 1 个。
+            out = apply.apply_plan(proj, {"mode": "plan", "reply": "换台盆", **replace}, region=REGION, message_id="c2")
+            _ok(f"carry-insert-crash:{label}-entry-later-ok", out.get("ok") is True and out.get("rev") == 1, str({k: out.get(k) for k in ("ok", "rev", "ok_count", "failed_count")}))
+            _ok(
+                f"carry-insert-crash:{label}-entry-later-swaps-once",
+                _count_name(src, "SINK") == 0 and _count_name(src, "SEAT_NEW") == 1,
+                str(_insert_names(apply._read_doc(src))),
+            )
+
+    # 库块：导入定义之后插入才抛错 → 这次新导入的定义、半成品都要撤掉；本来就在图里的定义不删。
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        lib = root / "lib"
+        lib.mkdir()
+        src = root / "libcrash.dxf"
+        _carry_crash_doc(src)
+
+        def _clean_lib(d):
+            b = d.blocks.new("LIB_SEAT")
+            _square(b, 300)
+
+        index = _library_index(lib, "LIB_SEAT", _clean_lib)
+        patch_lib = (
+            mock.patch.object(library, "get_index", return_value=index),
+            mock.patch.object(library, "index_path", return_value=lib / "index.json"),
+        )
+        patch_lib[0].start()
+        patch_lib[1].start()
+        try:
+            for label, fail_after_add in (("after", True), ("before", False)):
+                doc = apply._read_doc(src)
+                imported = []
+                real_import = apply._import_block
+
+                def _spy_import(target, block_name, *args, **kwargs):
+                    before = block_name in target.blocks
+                    ok = real_import(target, block_name, *args, **kwargs)
+                    if target is doc and not before and block_name in target.blocks:
+                        imported.append(block_name)
+                    return ok
+
+                with mock.patch.object(apply, "_import_block", side_effect=_spy_import), _partial_add(fail_after_add) as patch:
+                    results = _crash_replace(doc, {"inserts": [{"block": "LIB_SEAT", "xy": [9000, 3000]}]}, patch)
+                _ok(f"carry-insert-crash:lib-{label}-not-ok", not results[0].get("ok"), str(_brief(results)))
+                # 库块必须真的导进了调用方这张图，再被撤回——否则「定义已撤」是空转的。
+                _ok(f"carry-insert-crash:lib-{label}-imported-into-caller", imported == ["LIB_SEAT"], str(imported))
+                _ok(f"carry-insert-crash:lib-{label}-def-removed", "LIB_SEAT" not in doc.blocks, str(list(doc.blocks)))
+                _ok(f"carry-insert-crash:lib-{label}-no-insert", _insert_entities(doc, "LIB_SEAT") == [])
+                _ok(f"carry-insert-crash:lib-{label}-no-orphan", _orphan_inserts(doc) == [], str(_orphan_inserts(doc)))
+                _ok(f"carry-insert-crash:lib-{label}-original-kept", _insert_names(doc).count("SINK") == 1, str(_insert_names(doc)))
+                ok = apply.apply_mutations(doc, {"inserts": [{"block": "LIB_SEAT", "xy": [9000, 3000]}]}, bbox=BOX, layer="L", region=REGION, issues=[])
+                _ok(f"carry-insert-crash:lib-{label}-later-ok", ok[0].get("ok") is True and ok[0].get("imported") is True, str(_brief(ok)))
+                _ok(f"carry-insert-crash:lib-{label}-later-once", len(_insert_entities(doc, "LIB_SEAT")) == 1)
+                # 新块定义本来就在本图里：失败时也不能把它删掉。
+                doc = apply._read_doc(src)
+                doc.blocks.new("EXISTING_SEAT")
+                before_defs = sorted(r.dxf.name for r in doc.blocks.block_records)
+                with _partial_add(fail_after_add) as patch:
+                    results = _crash_replace(doc, {"inserts": [{"block": "EXISTING_SEAT", "xy": [9000, 3000]}]}, patch)
+                _ok(f"carry-insert-crash:existing-{label}-def-kept", not results[0].get("ok") and sorted(r.dxf.name for r in doc.blocks.block_records) == before_defs, str(sorted(r.dxf.name for r in doc.blocks.block_records)))
+                _ok(f"carry-insert-crash:existing-{label}-no-stray", _insert_entities(doc, "EXISTING_SEAT") == [])
+        finally:
+            patch_lib[0].stop()
+            patch_lib[1].stop()
+
+
 # ================================================================ K. 提示词与摘录口径
 
 
@@ -1803,6 +2124,7 @@ def main() -> int:
     test_chat_repair_propagates_accepted_schema()
     test_delete_failure_is_not_success()
     test_delete_public_api_and_attribs()
+    test_carry_insert_crash_is_clean()
     test_normalize_keeps_first_pass_result()
     test_prompt_nested_wording_safe()
     print("ALL PASSED", flush=True)
